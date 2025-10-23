@@ -70,13 +70,14 @@ The generated executable will appear in the `dist` folder.
 6. If you do not see three points on one of the images, the program will skip the image if no points are placed.
 7. Choose the transform mode: **Euclidean** (no scale) or **Similarity** (with scale).
 8. Click **"Align and Save FITS"** and choose an output directory.
-9. Aligned images will be saved as `aligned_00001.fit`, `aligned_00002.fit`, etc.
+9. Aligned images will be saved as `aligned_00001.fit`, `aligned_00002.fit`, etc. Can be automatically opened in Siril as sequence `aligned.seq`
 
 ---
 
 alignment_points.txt - user-defined points for each image. 
 
 transformed_points.txt - points after geometric alignment.
+
 
 
 
