@@ -75,6 +75,8 @@ The generated executable will appear in the `dist` folder.
 ---
 
 alignment_points.txt - user-defined points for each image. 
+
 transformed_points.txt - points after geometric alignment.
+
 
 
