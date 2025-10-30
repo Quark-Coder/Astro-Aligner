@@ -1,17 +1,18 @@
 # AstroAligner v1.0
 <img width="1537" height="915" alt="python_PXwkMmm1gq" src="https://github.com/user-attachments/assets/29123f7e-026b-4a57-8456-5282f3c933f0" />
+<img width="1537" height="904" alt="python_NYe0ii0skj" src="https://github.com/user-attachments/assets/d28328df-3816-4f5f-a5ef-be5debada058" />
 
-A manual alignment tool for astronomical images (DNG format) when automatic star detection methods fail.
+A manual alignment tool for astronomical images when automatic star detection methods fail.
 
 https://github.com/user-attachments/assets/7024b787-57e1-40ca-a014-eaa552b8a007
 
-AstroAligner allows you to manually select 3 non-collinear points on each image to align a sequence of astrophotos relative to a chosen reference frame. It produces aligned FITS files ready for stacking or further astrophotometric processing.
+AstroAligner allows you to manually select 3 non-collinear points or comet coma and tail on each image to align a sequence of astrophotos relative to a chosen reference frame. It produces aligned FITS files ready for stacking or further astrophotometric processing.
 
 ---
 
 ## Features
 
-* Manual 3-point alignment of DNG astrophotos
+* Manual 3-point alignment / comet alignment
 * Euclidean or similarity transformation modes
 * Visual crosshair markers for precise point placement
 * Mouse-based panning and zooming
@@ -80,6 +81,7 @@ The generated executable will appear in the `dist` folder.
 alignment_points.txt - user-defined points for each image. 
 
 transformed_points.txt - points after geometric alignment.
+
 
 
 
