@@ -1,4 +1,4 @@
-# AstroAligner v1.0
+# AstroAligner v1.1
 <img width="1537" height="915" alt="python_PXwkMmm1gq" src="https://github.com/user-attachments/assets/29123f7e-026b-4a57-8456-5282f3c933f0" />
 <img width="1537" height="904" alt="python_NYe0ii0skj" src="https://github.com/user-attachments/assets/d28328df-3816-4f5f-a5ef-be5debada058" />
 
@@ -81,6 +81,7 @@ The generated executable will appear in the `dist` folder.
 alignment_points.txt - user-defined points for each image. 
 
 transformed_points.txt - points after geometric alignment.
+
 
 
 
