@@ -373,6 +373,7 @@ class ImageViewer(QMainWindow):
         print(f"DEBUG: Reference store init (in-memory): {self.reference_store}")
 
         self.align_points_items = []
+        self.guide_points_items = []  # NEW: Store guide points from previous image
         self.points_count = 0
         self.drag_point_index = None
         self.dragging = False
@@ -383,6 +384,11 @@ class ImageViewer(QMainWindow):
         self.drag_slow_factor_normal = 1.0
 
         self.cross_size = 80.0
+
+        # NEW: Star detection settings
+        self.star_snap_enabled = True
+        self.star_snap_radius = 15  # pixels to search around click
+        self.star_snap_threshold = 0.3  # relative brightness threshold (0-1)
 
         self.loader_signals = LoaderSignals()
         self.loader_signals.pixmap_ready.connect(self.on_pixmap_ready)
@@ -418,6 +424,7 @@ class ImageViewer(QMainWindow):
 
         self.load_button = QPushButton("Load working directory")
         self.load_button.clicked.connect(self.load_directory)
+        self.load_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)  # Prevent focus
         left_layout.addWidget(self.load_button)
 
         # НОВОЕ: Align type (3 Point / Comet only)
@@ -431,6 +438,8 @@ class ImageViewer(QMainWindow):
         self.align_type_combo.addItem("Comet only", userData="comet")
         self.align_type_combo.setCurrentIndex(0)
         self.align_type_combo.currentIndexChanged.connect(self.on_align_type_changed)
+        self.align_type_combo.setFocusPolicy(Qt.FocusPolicy.StrongFocus)  # Only on tab/click
+        self.align_type_combo.installEventFilter(self)
         left_layout.addWidget(self.align_type_combo)
 
         self.current_label = QLabel("No image loaded\n0/0")
@@ -464,6 +473,7 @@ class ImageViewer(QMainWindow):
 
         self.clear_points_button = QPushButton("Clear points")
         self.clear_points_button.clicked.connect(self.on_clear_points_clicked)
+        self.clear_points_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)  # Prevent focus
         left_layout.addWidget(self.clear_points_button)
 
         stretch_label = QLabel("Stretch factor")
@@ -473,6 +483,10 @@ class ImageViewer(QMainWindow):
         self.stretch_slider.setRange(10, 500)
         self.stretch_slider.setValue(100)
         self.stretch_slider.sliderMoved.connect(self.on_stretch_slider_changed)
+        # Sliders need focus for keyboard interaction, but we'll handle arrows specially
+        self.stretch_slider.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+        # Install event filter to intercept arrow keys
+        self.stretch_slider.installEventFilter(self)
         left_layout.addWidget(self.stretch_slider)
 
         black_label = QLabel("Black points")
@@ -481,17 +495,27 @@ class ImageViewer(QMainWindow):
         self.black_slider.setRange(0, 100)
         self.black_slider.setValue(0)
         self.black_slider.sliderMoved.connect(self.on_black_slider_changed)
+        self.black_slider.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+        self.black_slider.installEventFilter(self)
         left_layout.addWidget(self.black_slider)
-        
+
         self.monochrome_checkbox = QCheckBox("Monochrome")
         self.monochrome_checkbox.setChecked(True)
         self.monochrome_checkbox.stateChanged.connect(self.on_monochrome_changed)
+        self.monochrome_checkbox.setFocusPolicy(Qt.FocusPolicy.NoFocus)  # Prevent focus
         left_layout.addWidget(self.monochrome_checkbox)
+
+        self.star_snap_checkbox = QCheckBox("Star snap")
+        self.star_snap_checkbox.setChecked(True)
+        self.star_snap_checkbox.stateChanged.connect(self.on_star_snap_changed)
+        self.star_snap_checkbox.setFocusPolicy(Qt.FocusPolicy.NoFocus)  # Prevent focus
+        left_layout.addWidget(self.star_snap_checkbox)
 
         self.apply_global_button = QPushButton("Apply global")
         self.apply_global_button.clicked.connect(self.on_apply_global_clicked)
+        self.apply_global_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)  # Prevent focus
         left_layout.addWidget(self.apply_global_button)
-        
+
         reduce_label = QLabel("Reduce display resolution")
         left_layout.addWidget(reduce_label)
         self.reduce_combo = QComboBox()
@@ -501,10 +525,13 @@ class ImageViewer(QMainWindow):
         self.reduce_combo.addItem("6x")
         self.reduce_combo.setCurrentIndex(0)
         self.reduce_combo.currentTextChanged.connect(self.on_reduce_resolution_changed)
+        self.reduce_combo.setFocusPolicy(Qt.FocusPolicy.StrongFocus)  # Only on tab/click
+        self.reduce_combo.installEventFilter(self)
         left_layout.addWidget(self.reduce_combo)
 
         self.reference_checkbox = QCheckBox("Reference image")
         self.reference_checkbox.stateChanged.connect(self.on_reference_checkbox_changed)
+        self.reference_checkbox.setFocusPolicy(Qt.FocusPolicy.NoFocus)  # Prevent focus
         left_layout.addWidget(self.reference_checkbox)
 
         align_label = QLabel("Align method")
@@ -517,10 +544,13 @@ class ImageViewer(QMainWindow):
         self.align_method_combo.currentIndexChanged.connect(
             self.on_align_method_changed
         )
+        self.align_method_combo.setFocusPolicy(Qt.FocusPolicy.StrongFocus)  # Only on tab/click
+        self.align_method_combo.installEventFilter(self)
         left_layout.addWidget(self.align_method_combo)
 
         self.align_button = QPushButton("Align")
         self.align_button.clicked.connect(self.on_align_clicked)
+        self.align_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)  # Prevent focus
         left_layout.addWidget(self.align_button)
 
         left_layout.addStretch()
@@ -546,6 +576,30 @@ class ImageViewer(QMainWindow):
         self.setFocus()
 
         self.update_align_indicators()
+
+    def eventFilter(self, obj, event):
+        """
+        NEW: Event filter to intercept arrow keys on widgets and route them to image navigation.
+        This ensures arrow keys always work for changing images, even when widgets have focus.
+        """
+        if event.type() == event.Type.KeyPress:
+            if event.key() in (Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_Up, Qt.Key.Key_Down):
+                # For horizontal sliders, allow left/right arrows to adjust the slider
+                if obj in (self.stretch_slider, self.black_slider):
+                    if event.key() in (Qt.Key.Key_Left, Qt.Key.Key_Right):
+                        # Let the slider handle left/right
+                        return super().eventFilter(obj, event)
+
+                # For combo boxes, let them handle up/down when they're open/active
+                if isinstance(obj, QComboBox) and obj.isVisible():
+                    if obj.view().isVisible():  # Dropdown is open
+                        return super().eventFilter(obj, event)
+
+                # For all other cases, route arrow keys to main window for image navigation
+                # Prevent the widget from handling the event
+                return self.keyPressEvent(event)
+
+        return super().eventFilter(obj, event)
 
     def on_pixmap_ready(self, idx: int, pixmap):
         """Обработчик готового pixmap'а из потока."""
@@ -762,6 +816,9 @@ class ImageViewer(QMainWindow):
         else:
             self.align_type = "3point"
 
+    def on_star_snap_changed(self, state: int):
+        self.star_snap_enabled = (state == Qt.CheckState.Checked.value or state == 2)
+
     def on_align_method_changed(self, index: int):
         data = self.align_method_combo.itemData(index)
         if data in ("rotate_shift", "rotate_shift_scale"):
@@ -879,11 +936,32 @@ class ImageViewer(QMainWindow):
         img_key = self.get_image_key(img_path)
         points_data = self.alignment_store[dir_key].get(img_key)
         if not points_data:
-            return
+            points_data = []
 
+        # Load current image's actual alignment points
         for pd in points_data[:3]:
             img_pos = QPointF(float(pd["x"]), float(pd["y"]))
             self.add_point_from_image_coords(img_pos)
+
+        # NEW: Load previous image's points as guide points
+        current_index_in_files = -1
+        for i, path in enumerate(self.file_paths):
+            if path == img_path:
+                current_index_in_files = i
+                break
+
+        if current_index_in_files > 0:
+            # There's a previous image
+            prev_img_path = self.file_paths[current_index_in_files - 1]
+            prev_img_key = self.get_image_key(prev_img_path)
+
+            if dir_key in self.alignment_store and prev_img_key in self.alignment_store[dir_key]:
+                prev_points_data = self.alignment_store[dir_key][prev_img_key]
+                if prev_points_data and len(prev_points_data) > 0:
+                    # Add guide points only if we don't have actual points at those positions
+                    for pd in prev_points_data[:3]:
+                        img_pos = QPointF(float(pd["x"]), float(pd["y"]))
+                        self.add_guide_point_from_image_coords(img_pos, len(self.guide_points_items))
 
         self.update_align_indicators()
 
@@ -899,12 +977,27 @@ class ImageViewer(QMainWindow):
                 if obj is not None:
                     scene.removeItem(obj)
         self.align_points_items.clear()
+        self.clear_guide_markers()  # NEW: Also clear guide markers
         self.points_count = 0
         self.drag_point_index = None
         self.dragging = False
         self.drag_start_scene = None
         self.drag_start_img_pos = None
         self.update_align_indicators()
+
+    def clear_guide_markers(self):
+        """NEW: Clear only guide point markers"""
+        scene = self.viewer._scene
+        for item in self.guide_points_items:
+            for key in (
+                "h_outer_left", "h_outer_right", "h_inner",
+                "v_outer_top", "v_outer_bottom", "v_inner",
+                "circle", "text"
+            ):
+                obj = item.get(key)
+                if obj is not None:
+                    scene.removeItem(obj)
+        self.guide_points_items.clear()
 
 
 
@@ -917,12 +1010,40 @@ class ImageViewer(QMainWindow):
         # Переводим в координаты полного массива
         img_pos = self.display_to_img(disp_pos)
 
-        if self.points_count < 3:
-            self.add_point_from_image_coords(img_pos)
+        # NEW: Apply star detection to snap to nearest bright star
+        refined_pos = self.find_star_centroid(img_pos)
+
+        # NEW: First check if user clicked near a guide point
+        guide_idx = self.find_nearest_guide_point(scene_pos, max_dist=20.0)
+        if guide_idx is not None and self.points_count < 3:
+            # Replace guide point with actual alignment point
+            # Remove the guide point
+            scene = self.viewer._scene
+            guide_item = self.guide_points_items[guide_idx]
+            for key in (
+                "h_outer_left", "h_outer_right", "h_inner",
+                "v_outer_top", "v_outer_bottom", "v_inner",
+                "circle", "text"
+            ):
+                obj = guide_item.get(key)
+                if obj is not None:
+                    scene.removeItem(obj)
+            self.guide_points_items.pop(guide_idx)
+
+            # Add actual alignment point at the refined position
+            self.add_point_from_image_coords(refined_pos)
             self.drag_point_index = self.points_count - 1
             self.dragging = True
             self.drag_start_scene = scene_pos
-            self.drag_start_img_pos = img_pos   # полные координаты
+            self.drag_start_img_pos = refined_pos
+            return
+
+        if self.points_count < 3:
+            self.add_point_from_image_coords(refined_pos)
+            self.drag_point_index = self.points_count - 1
+            self.dragging = True
+            self.drag_start_scene = scene_pos
+            self.drag_start_img_pos = refined_pos   # полные координаты
             return
 
         idx = self.find_nearest_point(scene_pos, max_dist=20.0)
@@ -981,6 +1102,95 @@ class ImageViewer(QMainWindow):
         self.drag_point_index = None
         self.drag_start_scene = None
         self.drag_start_img_pos = None
+
+    def find_star_centroid(self, img_pos: QPointF) -> QPointF:
+        """
+        NEW: Find the centroid of the brightest star near the given position.
+        Returns the refined position, or original position if no star detected.
+        """
+        if not self.star_snap_enabled:
+            return img_pos
+
+        if not self.file_paths or self.current_index < 0 or self.current_index >= len(self.file_paths):
+            return img_pos
+
+        # Get raw image data
+        arr = self.raw_cache.get(self.current_index)
+        if arr is None:
+            return img_pos
+
+        # Convert to grayscale if needed
+        if arr.ndim == 3:
+            # Use green channel for color images, or convert to grayscale
+            if arr.shape[2] >= 2:
+                img_data = arr[:, :, 1]  # Green channel
+            else:
+                img_data = arr[:, :, 0]
+        else:
+            img_data = arr
+
+        # Get click position in pixel coordinates
+        x = int(img_pos.x())
+        y = int(img_pos.y())
+
+        h, w = img_data.shape
+
+        # Boundary check
+        if x < 0 or x >= w or y < 0 or y >= h:
+            return img_pos
+
+        # Extract local region
+        radius = self.star_snap_radius
+        x_min = max(0, x - radius)
+        x_max = min(w, x + radius + 1)
+        y_min = max(0, y - radius)
+        y_max = min(h, y + radius + 1)
+
+        region = img_data[y_min:y_max, x_min:x_max]
+
+        if region.size == 0:
+            return img_pos
+
+        # Find local brightness statistics
+        local_min = region.min()
+        local_max = region.max()
+        local_mean = region.mean()
+
+        # If the region is too dim or flat, don't snap
+        if local_max < self.star_snap_threshold or (local_max - local_min) < 0.1:
+            return img_pos
+
+        # Calculate threshold for star detection
+        # Use adaptive threshold based on local statistics
+        threshold = local_mean + 0.6 * (local_max - local_mean)
+
+        # Create binary mask of pixels above threshold
+        mask = region > threshold
+
+        if not mask.any():
+            return img_pos
+
+        # Calculate centroid of bright pixels
+        # Use intensity-weighted centroid for better accuracy
+        y_indices, x_indices = np.where(mask)
+        intensities = region[mask]
+
+        if len(intensities) == 0:
+            return img_pos
+
+        # Intensity-weighted centroid
+        total_intensity = intensities.sum()
+        if total_intensity == 0:
+            return img_pos
+
+        centroid_x = (x_indices * intensities).sum() / total_intensity
+        centroid_y = (y_indices * intensities).sum() / total_intensity
+
+        # Convert back to absolute image coordinates
+        refined_x = x_min + centroid_x
+        refined_y = y_min + centroid_y
+
+        return QPointF(refined_x, refined_y)
 
     def add_point_from_image_coords(self, img_pos: QPointF):
         # img_pos - координаты в полном разрешении (array), а не pixmap
@@ -1081,6 +1291,93 @@ class ImageViewer(QMainWindow):
         self.points_count += 1
         self.update_align_indicators()
 
+    def add_guide_point_from_image_coords(self, img_pos: QPointF, index: int):
+        """NEW: Add a guide point marker (yellow, from previous image)"""
+        if not self.viewer.hasPhoto():
+            return
+
+        scene = self.viewer._scene
+
+        size = self.cross_size
+        half = size / 2.0
+
+        circle_diam = 12.0
+        circle_r = circle_diam / 2.0
+
+        # Переводим координаты из полного масштаба в координаты pixmap
+        disp_pos = self.img_to_display(img_pos)
+        scene_pos = self.viewer._photo.mapToScene(disp_pos)
+        cx, cy = scene_pos.x(), scene_pos.y()
+
+        # Внешние части перекрестия — ЖЕЛТЫЕ (не зеленые)
+        outer_pen = QPen(QColor(255, 255, 0, 180), 2.0)  # Yellow
+        outer_pen.setCosmetic(True)
+
+        # Внутренние части — полупрозрачные желтые
+        inner_pen = QPen(QColor(255, 255, 0, 100), 2.0)  # Yellow, more transparent
+        inner_pen.setCosmetic(True)
+
+        # Горизонтальный луч
+        h_outer_left = QGraphicsLineItem(cx - half, cy, cx - circle_r, cy)
+        h_outer_right = QGraphicsLineItem(cx + circle_r, cy, cx + half, cy)
+        h_inner = QGraphicsLineItem(cx - circle_r, cy, cx + circle_r, cy)
+
+        # Вертикальный луч
+        v_outer_top = QGraphicsLineItem(cx, cy - half, cx, cy - circle_r)
+        v_outer_bottom = QGraphicsLineItem(cx, cy + circle_r, cx, cy + half)
+        v_inner = QGraphicsLineItem(cx, cy - circle_r, cx, cy + circle_r)
+
+        for item in (h_outer_left, h_outer_right, v_outer_top, v_outer_bottom):
+            item.setPen(outer_pen)
+            item.setZValue(900)  # Ниже чем реальные точки (1000)
+
+        for item in (h_inner, v_inner):
+            item.setPen(inner_pen)
+            item.setZValue(900)
+
+        # Круг — желтый
+        circle_pen = QPen(QColor(255, 255, 0, 160), 2.0)  # Yellow
+        circle_pen.setCosmetic(True)
+        circle = QGraphicsEllipseItem(
+            cx - circle_r, cy - circle_r, circle_diam, circle_diam
+        )
+        circle.setPen(circle_pen)
+        circle.setBrush(QColor(0, 0, 0, 0))  # прозрачная заливка
+        circle.setZValue(899)
+
+        # Номер точки — желтый
+        text_item = QGraphicsSimpleTextItem(str(index + 1))
+        text_item.setBrush(QColor(255, 255, 0, 200))  # Yellow
+        text_font = QFont()
+        text_font.setPointSize(30)
+        text_item.setFont(text_font)
+        text_item.setPos(cx + half + 6, cy - half - 4)
+        text_item.setZValue(901)
+
+        # Добавляем в сцену
+        scene.addItem(h_outer_left)
+        scene.addItem(h_outer_right)
+        scene.addItem(h_inner)
+        scene.addItem(v_outer_top)
+        scene.addItem(v_outer_bottom)
+        scene.addItem(v_inner)
+        scene.addItem(circle)
+        scene.addItem(text_item)
+
+        # Сохраняем в guide_points_items
+        self.guide_points_items.append({
+            "img_pos": img_pos,        # полное разрешение
+            "h_outer_left": h_outer_left,
+            "h_outer_right": h_outer_right,
+            "h_inner": h_inner,
+            "v_outer_top": v_outer_top,
+            "v_outer_bottom": v_outer_bottom,
+            "v_inner": v_inner,
+            "circle": circle,
+            "text": text_item,
+            "circle_diam": circle_diam,
+        })
+
 
     def _update_point_graphics(self, index: int):
         if not (0 <= index < len(self.align_points_items)):
@@ -1130,6 +1427,31 @@ class ImageViewer(QMainWindow):
         best_d2 = max_d2
 
         for i, item in enumerate(self.align_points_items):
+            img_pos = item["img_pos"]                  # полные координаты
+            disp_pos = self.img_to_display(img_pos)    # в координаты pixmap
+            p_scene = self.viewer._photo.mapToScene(disp_pos)
+
+            dx = p_scene.x() - scene_pos.x()
+            dy = p_scene.y() - scene_pos.y()
+            d2 = dx * dx + dy * dy
+            if d2 <= best_d2:
+                best_d2 = d2
+                best_idx = i
+
+        return best_idx
+
+    def find_nearest_guide_point(self, scene_pos: QPointF, max_dist: float = 20.0):
+        """NEW: Find nearest guide point (from previous image)"""
+        if not self.guide_points_items:
+            return None
+        if not self.viewer.hasPhoto():
+            return None
+
+        max_d2 = max_dist * max_dist
+        best_idx = None
+        best_d2 = max_d2
+
+        for i, item in enumerate(self.guide_points_items):
             img_pos = item["img_pos"]                  # полные координаты
             disp_pos = self.img_to_display(img_pos)    # в координаты pixmap
             p_scene = self.viewer._photo.mapToScene(disp_pos)
