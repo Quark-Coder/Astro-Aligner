@@ -1,7 +1,6 @@
 # AstroAligner v1.3
 
-<img width="1537" height="915" alt="AstroAligner_main_ui" src="https://github.com/user-attachments/assets/29123f7e-026b-4a57-8456-5282f3c933f0" />
-<img width="1537" height="904" alt="AstroAligner_alignment" src="https://github.com/user-attachments/assets/d28328df-3816-4f5f-a5ef-be5debada058" />
+<img width="1920" height="1020" alt="python_BOf3SODMUT" src="https://github.com/user-attachments/assets/d1fb5e46-3766-4b2b-abda-138317ead715" />
 
 AstroAligner is a manual alignment tool for astronomical images designed for situations where automatic star detection fails.
 It supports RAW, FITS and standard image formats and allows precise 3 point or comet based alignment with visual magnification and fine drag control.
@@ -191,3 +190,4 @@ Reference frame index is remembered per working directory session.
 ---
 
 AstroAligner v1.3 focuses on manual precision alignment for difficult datasets including comets, low SNR frames and star trailing sequences.
+
