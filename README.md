@@ -1,90 +1,193 @@
-# AstroAligner v1.1
-<img width="1537" height="915" alt="python_PXwkMmm1gq" src="https://github.com/user-attachments/assets/29123f7e-026b-4a57-8456-5282f3c933f0" />
-<img width="1537" height="904" alt="python_NYe0ii0skj" src="https://github.com/user-attachments/assets/d28328df-3816-4f5f-a5ef-be5debada058" />
+# AstroAligner v1.3
 
-A manual alignment tool for astronomical images when automatic star detection methods fail.
+<img width="1537" height="915" alt="AstroAligner_main_ui" src="https://github.com/user-attachments/assets/29123f7e-026b-4a57-8456-5282f3c933f0" />
+<img width="1537" height="904" alt="AstroAligner_alignment" src="https://github.com/user-attachments/assets/d28328df-3816-4f5f-a5ef-be5debada058" />
 
-https://github.com/user-attachments/assets/7024b787-57e1-40ca-a014-eaa552b8a007
+AstroAligner is a manual alignment tool for astronomical images designed for situations where automatic star detection fails.
+It supports RAW, FITS and standard image formats and allows precise 3 point or comet based alignment with visual magnification and fine drag control.
 
-AstroAligner allows you to manually select 3 non-collinear points or comet coma and tail on each image to align a sequence of astrophotos relative to a chosen reference frame. It produces aligned FITS files ready for stacking or further astrophotometric processing.
+---
+
+## What’s New in v1.3
+
+* Full PyQt6 interface redesign
+* Background threaded image loading with smart caching
+* Support for RAW formats via rawpy
+* FITS metadata handling via astropy
+* EXIF observation date extraction
+* Magnifier overlay for subpixel precision
+* Shift key fine adjustment while dragging points
+* Display resolution reduction mode 1x, 2x, 4x, 6x
+* Monochrome preview mode
+* Persistent per directory reference image
+* Automatic alignment point autosave in JSON
+* Euclidean and Affine transform modes
+* Comet only alignment mode
+* Observation date written to FITS header
+* Preserved zoom and pan between frames
+
+---
+
+## Supported Formats
+
+* RAW: .nef, .cr2, .cr3, .crw, .arw, .raf, .dng, .orf, .rw2, .pef, .x3f
+* FITS: .fit, .fits
+* Images: .png, .jpg, .jpeg, .tif, .tiff
 
 ---
 
 ## Features
 
-* Manual 3-point alignment / comet alignment
-* Euclidean or similarity transformation modes
-* Visual crosshair markers for precise point placement
-* Mouse-based panning and zooming
-* Automatic image stretch for faint targets
-* Saves aligned images as 16-bit FITS with metadata
-* Auto-saving and loading of alignment points
+### Manual Alignment Modes
+
+* 3 Point mode
+  Select 3 non collinear stars on each image.
+
+* Comet Only mode
+  Designed for comet sequences. Use coma and tail structure as reference.
+
+### Transform Methods
+
+* Euclidean
+  Rotation + translation.
+
+* Affine
+  Rotation + translation + scale.
+
+### Precision Tools
+
+* Crosshair markers with indexed labels
+* Enlarged center circle for better targeting
+* Live magnifier overlay near cursor
+* Shift modifier for ultra fine dragging
+* Visual alignment status indicators
+
+### Display Controls
+
+* Stretch factor slider
+* Black point slider
+* Monochrome preview toggle
+* Reduce display resolution 1x to 6x for performance
+
+### Performance
+
+* Background threaded loader
+* Priority queue based image preloading
+* Smart memory cache with automatic trimming
+* Raw data cache for fast re rendering
+
+### Metadata Handling
+
+* Reads DATE-OBS, DATE, Observation Date from FITS
+* Reads EXIF DateTimeOriginal for RAW and JPEG
+* Fallback to filesystem timestamp
+* Writes observation date to aligned FITS output
+
+### Persistence
+
+* Alignment points stored per directory in JSON
+* Reference frame stored per working directory
+* Automatic restore when reopening directory
 
 ---
 
 ## Installation
-
-You can run AstroAligner either as a Python script or as a standalone executable.
 
 ### Option 1 - Run with Python
 
 #### Requirements
 
 * Python 3.9 or newer
-* Install dependencies:
+
+Install dependencies:
 
 ```bash
-pip install numpy pillow rawpy astropy opencv-python exifread
+pip install numpy opencv-python pillow rawpy astropy exifread PyQt6
 ```
 
-#### Run
+Run:
 
 ```bash
-python AstroAligner_v1.0.py
+python aa_pyqt_v1.3.py
 ```
-Or just double click.
 
-### Option 2 - Build or Use the Standalone EXE
+---
 
-If you have a precompiled version:
+### Option 2 - Build Standalone EXE
 
-* Download `AstroAligner_v1.0.exe`
-* Run it directly (no installation required)
-
-If you want to build it yourself:
+Install PyInstaller:
 
 ```bash
 pip install pyinstaller
+```
+
+Build:
+
+```bash
 build.cmd
 ```
 
-The generated executable will appear in the `dist` folder.
+Executable will appear in the dist folder.
 
 ---
 
 ## Usage
 
-1. **Launch** the application.
-2. Click **"Load DNG Directory"** and select the folder containing your `.dng` files.
-3. Navigate between images using **Left/Right arrow keys** or **Previous/Next** buttons.
-4. On each image, click to mark **3 non-collinear points** (bright stars work best).
+1. Launch the application.
+2. Click "Load working directory".
+3. Select a folder containing RAW, FITS or image files.
+4. Navigate using:
 
-   * Indicators show progress (red/yellow/green).
-5. Select one image as **Reference** using the checkbox (*requires 3 valid points*).
-6. If you do not see three points on one of the images, the program will skip the image if no points are placed.
-7. Choose the transform mode: **Euclidean** (no scale) or **Similarity** (with scale).
-8. Click **"Align and Save FITS"** and choose an output directory.
-9. Aligned images will be saved as `aligned_00001.fit`, `aligned_00002.fit`, etc. Can be automatically opened in Siril as sequence `aligned.seq`
+   * Left and Right arrow keys
+5. Select alignment type:
+
+   * 3 Point
+   * Comet Only
+6. Place up to 3 points per image.
+7. Use Shift while dragging for fine adjustment.
+8. Mark one image as Reference.
+9. Choose transform method:
+
+   * Euclidean
+   * Affine
+10. Click Align.
+11. Select output directory.
+
+Aligned files will be saved as FITS with preserved observation metadata.
 
 ---
 
-alignment_points.txt - user-defined points for each image. 
+## Controls
 
-transformed_points.txt - points after geometric alignment.
+Mouse:
 
+* Left click - place or select alignment point
+* Left drag - move alignment point
+* Middle drag - pan image
+* Mouse wheel - zoom
 
+Keyboard:
 
+* Left Arrow - previous image
+* Right Arrow - next image
+* Shift - fine adjustment while dragging
 
+---
 
+## Output
 
+* 16 bit FITS files
+* Observation date written to header
+* Transform applied relative to selected reference frame
+* Files saved in selected output directory
 
+---
+
+## Internal Files
+
+Alignment data is stored in JSON format per directory.
+Reference frame index is remembered per working directory session.
+
+---
+
+AstroAligner v1.3 focuses on manual precision alignment for difficult datasets including comets, low SNR frames and star trailing sequences.
