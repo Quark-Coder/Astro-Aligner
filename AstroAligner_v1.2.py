@@ -1,1498 +1,1818 @@
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
 import os
-import numpy as np
-from PIL import Image, ImageTk
-import rawpy
-from astropy.io import fits
-import cv2
-import gc
-import math
+import sys
+import json
 import threading
-import re
-import exifread
+from queue import PriorityQueue
 from datetime import datetime
-import sys  # For icon path
 
-def is_raw_file(filename):
-    """Check if file is a RAW format."""
-    return filename.lower().endswith(('.dng', '.cr2', '.cr3'))
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, QWidget, QPushButton,
+                            QLabel, QFileDialog, QProgressBar, QGraphicsView, QGraphicsScene, QGraphicsPixmapItem,
+                            QMessageBox, QGraphicsLineItem, QGraphicsSimpleTextItem, QSlider, QCheckBox, QComboBox,
+                            QGraphicsEllipseItem)
+from PyQt6.QtGui import (QPixmap, QImage, QCursor, QPen, QFont, QPainter, QPainterPath, QColor)
+from PyQt6.QtCore import (Qt, QRectF, QPoint, QPointF, QSettings, QTimer, pyqtSignal, QObject)
 
-def autostretch_image(img, a=20.0, black_percent=0.0):
-    if len(img.shape) == 2:
-        ch = img.astype(np.float64) / 255.0
-    else:
-        ch = np.mean(img.astype(np.float64) / 255.0, axis=2)
-    # Apply black clip if >0
-    if black_percent > 0.0:
-        black_level = np.percentile(ch, black_percent)
-        ch = np.clip((ch - black_level) / (1.0 - black_level), 0.0, 1.0)
-    stretched_ch = np.arcsinh(a * ch) / np.arcsinh(a)
-    gamma = 0.8
-    stretched_ch = np.power(np.clip(stretched_ch, 0, 1), gamma)
-    stretched = np.clip(stretched_ch * 255, 0, 255).astype(np.uint8)
-    stretched_rgb = np.stack([stretched] * 3, axis=2)
-    return stretched_rgb
+import numpy as np
+import cv2
 
-def compute_transform(src_points, dst_points, mode="euclidean"):
-    src = np.asarray(src_points, dtype=np.float32)
-    dst = np.asarray(dst_points, dtype=np.float32)
-    if len(src) < 3 or len(dst) < 3:
-        raise ValueError("It takes at least 3 points to calculate the transformation.")
-    if mode == "similarity":
-        M, inliers = cv2.estimateAffinePartial2D(src.reshape((-1, 1, 2)), dst.reshape((-1, 1, 2)), method=cv2.LMEDS)
-        if M is None:
-            raise ValueError("Similarity transformation could not be evaluated. Check the points for collinearity.")
-        scale = np.sqrt(M[0, 0]**2 + M[1, 0]**2)
-        print(f"Similarity mode: {np.sum(inliers)} inliers, calculated scale={scale:.4f}")
-        return M, scale
-    elif mode == "euclidean":
-        src_mean = src.mean(axis=0)
-        dst_mean = dst.mean(axis=0)
-        src_c = src - src_mean
-        dst_c = dst - dst_mean
-        H = src_c.T @ dst_c
-        U, S, Vt = np.linalg.svd(H)
-        R = Vt.T @ U.T
-        if np.linalg.det(R) < 0:
-            Vt[-1, :] *= -1
-            R = Vt.T @ U.T
-        t = dst_mean - R @ src_mean
-        M = np.zeros((2, 3), dtype=np.float32)
-        M[:, :2] = R
-        M[:, 2] = t
-        scale = 1.0
-        return M, scale
-    else:
-        raise ValueError(f"Unknown conversion mode: {mode}")
+try:
+    from astropy.io import fits
+except ImportError:
+    fits = None
 
-def check_collinearity(points):
-    if len(points) != 3:
-        return False
-    p1, p2, p3 = points
-    area = 0.5 * abs((p2[0] - p1[0]) * (p3[1] - p1[1]) - (p3[0] - p1[0]) * (p2[1] - p1[1]))
-    return area > 10.0
+try:
+    import rawpy
+except ImportError:
+    rawpy = None
+    
+try:
+    import exifread
+except ImportError:
+    exifread = None
 
-def comet_to_triplet(ann):
-    if not ann or "center" not in ann or "tail_dir" not in ann:
-        return None
-    cx, cy = ann["center"]
-    tx, ty = ann["tail_dir"]
-    vec = np.array([tx - cx, ty - cy], dtype=np.float32)
-    length = np.linalg.norm(vec)
-    if length < 1e-3:
-        # No/zero tail: default direction (positive X for consistency)
-        unit_vec = np.array([1.0, 0.0], dtype=np.float32)
-    else:
-        unit_vec = vec / length  # Normalize: pure direction, ignore length
-    # Perpendicular unit vector (90° CCW, for stable rotation)
-    perp_unit = np.array([-unit_vec[1], unit_vec[0]], dtype=np.float32)
-    # Fixed unit scale (1.0): ignores radius and tail length completely
-    fixed_length = 1.0  # Arbitrary small value; makes triplet scale-invariant
-    tail_vec = unit_vec * fixed_length
-    perp_vec = perp_unit * fixed_length
-    p1 = np.array([cx, cy], dtype=np.float32)  # Center: translation anchor
-    p2 = p1 + tail_vec  # Tail direction: rotation only
-    p3 = p1 + perp_vec  # Perp: ensures rigidity, no scale/shear
-    return np.array([p1, p2, p3])
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tiff", ".tif"}
+FITS_EXT = {".fits", ".fit"}
+RAW_EXTS = {".nef", ".cr2", ".cr3", ".crw", ".arw", ".raf", ".dng", ".mrw", ".orf", ".rw2", ".pef", ".x3f"}
 
-def extract_description_dates(raw):
-    if not hasattr(raw, 'image_description') or not raw.image_description:
-        return {}
-    desc = raw.image_description
-    created = None
-    date_obs = None
-    subsec = ''
-    subsec_pattern = r'Sub Sec Time Original\s*:\s*(\d+)'
-    subsec_match = re.search(subsec_pattern, desc, re.IGNORECASE)
-    if subsec_match:
-        subsec_digits = subsec_match.group(1).ljust(6, '0')[:6]
-        subsec = '.' + subsec_digits
-    date_pattern = r'(Date/Time Original|Create Date|Observation Date)\s*:\s*(\d{4}[:-]\d{2}[:-]\d{2}[:\sT]\d{2}:\d{2}:\d{2})'
-    matches = re.findall(date_pattern, desc, re.IGNORECASE)
-    for label, date_str in matches:
-        if ' ' in date_str:
-            date_part, time_part = date_str.split(' ', 1)
-        elif 'T' in date_str:
-            date_part, time_part = date_str.split('T')
-        else:
-            date_part = date_str[:10]
-            time_part = date_str[10:]
-        date_part = date_part.replace(':', '-')
-        full_date = date_part + 'T' + time_part.strip()
-        if subsec and '.'.join(full_date.split('T')[1].split('.')[:1]) != full_date.split('T')[1]:
-            full_date += subsec
-        full_date = full_date.strip()
-        label_lower = label.lower()
-        if 'date/time original' in label_lower or 'create' in label_lower:
-            created = full_date
-        elif 'observation' in label_lower:
-            date_obs = full_date
-    dates = {}
-    if created:
-        dates['CREATED'] = created
-    if date_obs:
-        dates['DATE-OBS'] = date_obs
-    elif created:
-        dates['DATE-OBS'] = created
-    if dates:
-        return dates
-    return {}
+ALL_EXTS = IMAGE_EXTS | FITS_EXT | RAW_EXTS
 
-def extract_date_from_exif(file_path):
-    try:
-        with open(file_path, 'rb') as f:
-            tags = exifread.process_file(f, stop_tag='EXIF DateTimeOriginal')
-        if 'EXIF DateTimeOriginal' in tags:
-            date_time_str = str(tags['EXIF DateTimeOriginal']).strip()
-            dt = datetime.strptime(date_time_str, '%Y:%m:%d %H:%M:%S')
-            fits_date = dt.strftime('%Y-%m-%dT%H:%M:%S')
-            return fits_date
-        else:
-            print(f"DateTimeOriginal not found in EXIF for {os.path.basename(file_path)}")
-            return None
-    except Exception as e:
-        print(f"EXIF extraction failed for {os.path.basename(file_path)}: {e}")
-        return None
 
-def extract_raw_date(raw, file_path):
-    # Prioritize LibRaw timestamp (from EXIF DateTimeOriginal)
-    try:
-        if hasattr(raw.other, 'timestamp') and raw.other.timestamp > 0:
-            dt = datetime.fromtimestamp(raw.other.timestamp)
-            return dt.strftime('%Y-%m-%dT%H:%M:%S')
-    except:
-        pass  # Fall back if timestamp not available or invalid
-    # Fall back to EXIF
-    exif_date = extract_date_from_exif(file_path)
-    if exif_date:
-        return exif_date
-    # Fall back to description parsing (mainly for DNG)
-    dates = extract_description_dates(raw)
-    if 'DATE-OBS' in dates:
-        return dates['DATE-OBS']
-    return None
+class LoaderSignals(QObject):
+    pixmap_ready = pyqtSignal(int, object)
 
-def transform_points(M, points):
-    if M is None:
-        return points
-    points_np = np.array(points, dtype=np.float32).reshape(-1, 1, 2)
-    transformed = cv2.transform(points_np, M)
-    return transformed.reshape(-1, 2).tolist()
 
-def is_valid_comet_ann(ann):
-    """Validate comet annotation for reference or display."""
-    if not ann or "center" not in ann or "tail_dir" not in ann:
-        return False
-    cx, cy = ann["center"]
-    r = ann.get("radius", 0.0)
-    tx, ty = ann["tail_dir"]
-    vec_len = math.hypot(tx - cx, ty - cy)
-    return r > 0 and vec_len > 10.0
-
-class AstroAligner:
-    def __init__(self):
-        print("AstroAligner v1.8 - Fixed comet loading and reference restore")
-        self.root = tk.Tk()
-        self.root.title("Image Aligner for RAW/PNG/JPG Files (Stars & Comet)")
-        # Icon loading: fix for direct Python vs PyInstaller
-        try:
-            if getattr(sys, 'frozen', False):
-                # PyInstaller bundle: icon in extracted temp dir
-                icon_path = os.path.join(sys._MEIPASS, 'icon.ico')
-            else:  # Direct run: icon in script directory
-                icon_path = os.path.join(os.path.dirname(__file__), 'icon.ico')
-            self.root.iconbitmap(icon_path)
-        except (tk.TclError, FileNotFoundError) as e:
-            print(f"Failed to load icon: {e}. Using default Tkinter icon.")
-        self.root.bind("<Left>", lambda e: self.prev_image())
-        self.root.bind("<Right>", lambda e: self.next_image())
-        self.raw_files = []
-        self.display_pil_images = []
-        self.points_list = []
-        self.comet_ann = []
-        self.current_idx = 0
-        self.ref_idx = None
-        self.zoom_factor = 1.0
-        self.image_item = None
-        self.is_panning = False
-        self.dragged_point_idx = None
-        self.current_scaled_w = 0.0
-        self.current_scaled_h = 0.0
-        self.current_img_w = 0.0
-        self.current_img_h = 0.0
-        self.last_shown_idx = -1
-        self.initial_fit_done = False
-        self.preload_active = False
-        self.input_dir = None
-        self.raw_cache = None
-        self.display_scales = []  # Per-image scales for RAW/JPEG fix
-        self.transform_mode = tk.StringVar(value="euclidean")
-        self.align_mode = tk.StringVar(value="stars")
-        self.offset_x = 0.0
-        self.offset_y = 0.0
-        # Panning state
-        self.pan_start_x = 0
-        self.pan_start_y = 0
-        self.pan_start_offset_x = 0.0
-        self.pan_start_offset_y = 0.0
-        # Stretch settings
-        self.stretch_factor = 20.0
-        self.black_clip = 0.0
-        self.stretch_update_timer = None  # For debouncing full reload
-        # Comet-specific
-        self._comet_state = "idle"
-        self.dragged_comet_part = None
-        self.temp_comet_center = None
-        self.temp_comet_radius = 0.0
-        self.temp_tail_end = None
-        # Indicators
-        self.samples_subframe = None
-        self.indicators = []
-        self.setup_ui()
-        self.root.update_idletasks()
-        screen_w = self.root.winfo_screenwidth()
-        screen_h = self.root.winfo_screenheight()
-        max_w = min(1400, int(screen_w * 0.8))
-        max_h = min(800, int(screen_h * 0.8))
-        win_w = max(1000, max_w)
-        win_h = max(520, max_h)
-        x = (screen_w - win_w) // 2
-        y = (screen_h - win_h) // 2
-        self.root.geometry(f"{win_w}x{win_h}+{x}+{y}")
-        self.root.focus_set()
-
-    def reset_data(self):
-        self.raw_files.clear()
-        self.display_pil_images.clear()
-        self.points_list.clear()
-        self.comet_ann.clear()
-        self.current_idx = 0
-        self.ref_idx = None
-        self.zoom_factor = 1.0
-        self.last_shown_idx = -1
-        self.initial_fit_done = False
-        self.is_panning = False
-        self.dragged_point_idx = None
-        self.current_scaled_w = 0.0
-        self.current_scaled_h = 0.0
-        self.current_img_w = 0.0
-        self.current_img_h = 0.0
-        self.preload_active = False
-        self.offset_x = 0.0
-        self.offset_y = 0.0
-        self.pan_start_x = 0
-        self.pan_start_y = 0
-        self.pan_start_offset_x = 0.0
-        self.pan_start_offset_y = 0.0
-        self.raw_cache = None
-        self.display_scales = []  # Reset scales
-        self._comet_state = "idle"
-        self.dragged_comet_part = None
-        self.temp_comet_center = None
-        self.temp_comet_radius = 0.0
-        self.temp_tail_end = None
-        if hasattr(self, 'canvas'):
-            self.canvas.delete("all")
-        if hasattr(self, 'ref_label'):
-            self.ref_label.config(text="None selected")
-        if hasattr(self, 'set_ref_var'):
-            self.set_ref_var.set(False)
-        # Clear indicators but don't destroy subframe - will recreate on load
-        if hasattr(self, 'samples_subframe'):
-            for widget in self.samples_subframe.winfo_children():
-                widget.destroy()
-            self.indicators.clear()
-        # Cancel any pending stretch update
-        if self.stretch_update_timer is not None:
-            self.root.after_cancel(self.stretch_update_timer)
-            self.stretch_update_timer = None
-
-    def setup_ui(self):
-        main_container = ttk.Frame(self.root)
-        main_container.pack(fill=tk.BOTH, expand=True)
-        self.progress_var = tk.DoubleVar()
-        self.progress_bar = ttk.Progressbar(main_container, variable=self.progress_var, maximum=100)
-        self.progress_bar.pack(fill=tk.X, padx=5, pady=1)
-        self.status_label = ttk.Label(main_container, text="Ready")
-        self.status_label.pack(pady=1)
-        self.title_label = ttk.Label(main_container, text="", font=("Arial", 12, "bold"))
-        self.title_label.pack(pady=1)
-        # Fixed control panel (no scrolling)
-        self.control_frame = ttk.Frame(main_container, width=260, relief="ridge")
-        self.control_frame.pack(side=tk.LEFT, fill=tk.Y, padx=2, pady=1)
-        self.control_frame.pack_propagate(False)
-        # Load all control elements into fixed frame
-        load_btn = ttk.Button(self.control_frame, text="Load Directory", command=self.load_directory)
-        load_btn.pack(pady=1)
-        nav_frame = ttk.Frame(self.control_frame)
-        nav_frame.pack(pady=1)
-        ttk.Button(nav_frame, text="Previous", command=self.prev_image).pack(side=tk.LEFT, padx=1)
-        self.current_label = ttk.Label(nav_frame, text="Image 0/0")
-        self.current_label.pack(side=tk.LEFT, padx=2)
-        ttk.Button(nav_frame, text="Next", command=self.next_image).pack(side=tk.LEFT, padx=1)
-        # Align Mode (compact)
-        ttk.Label(self.control_frame, text="Align Mode:", font=("Arial", 9, "bold")).pack(pady=(2,0))
-        self.align_combo = ttk.Combobox(self.control_frame, textvariable=self.align_mode, values=["stars", "comet"], state="readonly", width=10)
-        self.align_combo.pack(pady=1)
-        self.align_mode.trace("w", self.on_align_mode_change)
-        # Transform Mode
-        ttk.Label(self.control_frame, text="Transform Mode:", font=("Arial", 9, "bold")).pack(pady=(2,0))
-        self.transform_combo = ttk.Combobox(self.control_frame, textvariable=self.transform_mode, values=["euclidean", "similarity"], state="readonly", width=10)
-        self.transform_combo.pack(pady=1)
-        self.transform_combo.bind("<<ComboboxSelected>>", lambda e: print(f"Transform mode: {self.transform_mode.get()}"))
-        # Stretch Settings (more compact)
-        ttk.Separator(self.control_frame, orient="horizontal").pack(pady=1, fill=tk.X)
-        ttk.Label(self.control_frame, text="Stretch Settings:", font=("Arial", 9, "bold")).pack(pady=(1,0))
-        # Stretch Factor
-        stretch_frame = ttk.Frame(self.control_frame)
-        stretch_frame.pack(pady=0, fill=tk.X)
-        ttk.Label(stretch_frame, text="Stretch Factor:").pack(anchor=tk.W)
-        self.stretch_var = tk.DoubleVar(value=self.stretch_factor)
-        self.stretch_slider = ttk.Scale(stretch_frame, from_=1.0, to=50.0, variable=self.stretch_var, orient=tk.HORIZONTAL, length=120, command=self.on_stretch_change)
-        self.stretch_slider.pack(pady=0, fill=tk.X)
-        self.stretch_label = ttk.Label(stretch_frame, text=f"{self.stretch_factor:.1f}")
-        self.stretch_label.pack(anchor=tk.W)
-        # Black Clip %
-        black_frame = ttk.Frame(self.control_frame)
-        black_frame.pack(pady=0, fill=tk.X)
-        ttk.Label(black_frame, text="Black Clip %:").pack(anchor=tk.W)
-        self.black_var = tk.DoubleVar(value=self.black_clip)
-        self.black_slider = ttk.Scale(black_frame, from_=0.0, to=20.0, variable=self.black_var, orient=tk.HORIZONTAL, length=120, command=self.on_stretch_change)
-        self.black_slider.pack(pady=0, fill=tk.X)
-        self.black_label = ttk.Label(black_frame, text=f"{self.black_clip:.1f}")
-        self.black_label.pack(anchor=tk.W)
-        # Samples (dynamic, compact)
-        ttk.Label(self.control_frame, text="Samples:", font=("Arial", 9, "bold")).pack(pady=(1,0))
-        self.samples_subframe = ttk.Frame(self.control_frame)
-        self.samples_subframe.pack(pady=0)
-        clear_btn = ttk.Button(self.control_frame, text="Clear Annotation", command=self.clear_current_points)
-        clear_btn.pack(pady=1)
-        ttk.Separator(self.control_frame, orient="horizontal").pack(pady=1, fill=tk.X)
-        ttk.Label(self.control_frame, text="Reference Image:", font=("Arial", 9, "bold")).pack(pady=(1,0))
-        self.ref_label = ttk.Label(self.control_frame, text="None selected", wraplength=250)
-        self.ref_label.pack(pady=0)
-        self.set_ref_var = tk.BooleanVar(value=False)
-        self.ref_checkbox = ttk.Checkbutton(self.control_frame, text="Set current as reference (requires 3 points)",
-                                            variable=self.set_ref_var, command=self.on_set_ref)
-        self.ref_checkbox.pack(pady=0)
-        ttk.Separator(self.control_frame, orient="horizontal").pack(pady=1, fill=tk.X)
-        align_btn = ttk.Button(self.control_frame, text="Align and Save FITS", command=self.align_and_save)
-        align_btn.pack(pady=2)
-        # Canvas frame (right side, with improved scrollbar span)
-        self.canvas_frame = ttk.Frame(main_container)
-        self.canvas_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
-        cv_scrollbar_v = ttk.Scrollbar(self.canvas_frame, orient=tk.VERTICAL)
-        cv_scrollbar_h = ttk.Scrollbar(self.canvas_frame, orient=tk.HORIZONTAL)
-        self.canvas = tk.Canvas(self.canvas_frame, bg="black")
-        # No yscroll/xscroll commands initially - will set dynamically if needed
-        cv_scrollbar_v.config(command=self.canvas.yview)
-        cv_scrollbar_h.config(command=self.canvas.xview)
-        self.canvas.config(yscrollcommand=cv_scrollbar_v.set, xscrollcommand=cv_scrollbar_h.set)
-        self.canvas.grid(row=0, column=0, sticky="nsew")
-        cv_scrollbar_v.grid(row=0, column=1, sticky="ns")
-        cv_scrollbar_h.grid(row=1, column=0, columnspan=2, sticky="ew")  # Span both columns for full width
-        self.canvas_frame.grid_rowconfigure(0, weight=1)
-        self.canvas_frame.grid_columnconfigure(0, weight=1)
-        self.canvas_frame.grid_columnconfigure(1, weight=0)
-        self.canvas_frame.grid_rowconfigure(1, weight=0)
-        self.canvas.bind("<Button-1>", self.on_click)
-        self.canvas.bind("<B1-Motion>", self.on_point_drag)
-        self.canvas.bind("<ButtonRelease-1>", self.on_point_release)
-        self.canvas.bind("<Button-2>", self.start_pan)
-        self.canvas.bind("<B2-Motion>", self.pan)
-        self.canvas.bind("<ButtonRelease-2>", self.stop_pan)
-        self.canvas.bind("<MouseWheel>", self.on_mousewheel)
-        self.canvas.bind("<Configure>", self.on_canvas_resize)
-        self.canvas.bind("<Enter>", lambda e: self.canvas.focus_set())
-        # Initial UI for stars mode
-        self.update_samples_ui()
-
-    def _update_scrollregion(self):
-        """Dynamically update scrollregion to cover canvas + image position (allows free panning)."""
-        canvas_w = self.canvas.winfo_width()
-        canvas_h = self.canvas.winfo_height()
-        if canvas_w <= 1 or canvas_h <= 1:
-            return
-        img_right = self.offset_x + self.current_scaled_w
-        img_bottom = self.offset_y + self.current_scaled_h
-        min_x = min(0.0, self.offset_x)
-        min_y = min(0.0, self.offset_y)
-        max_x = max(float(canvas_w), img_right)
-        max_y = max(float(canvas_h), img_bottom)
-        self.canvas.config(scrollregion=(min_x, min_y, max_x, max_y))
-
-    def _update_display_position(self, do_center=False):
-        """Update image position and scrollregion."""
-        canvas_w = self.canvas.winfo_width()
-        canvas_h = self.canvas.winfo_height()
-        if canvas_w <= 1 or canvas_h <= 1:
-            return
-        if do_center:
-            self.offset_x = max(0.0, (canvas_w - self.current_scaled_w) / 2.0)
-            self.offset_y = max(0.0, (canvas_h - self.current_scaled_h) / 2.0)
-        if self.image_item:
-            self.canvas.coords(self.image_item, self.offset_x, self.offset_y)
-        self._update_scrollregion()
-
-    def on_stretch_change(self, *args):
-        """Update values and labels immediately (no heavy ops for smooth dragging)."""
-        self.stretch_factor = self.stretch_var.get()
-        self.black_clip = self.black_var.get()
-        self.stretch_label.config(text=f"{self.stretch_factor:.1f}")
-        self.black_label.config(text=f"{self.black_clip:.1f}")
-        print(f"Stretch dragging: a={self.stretch_factor:.1f}, black_clip={self.black_clip:.1f}%")
-        # Cancel pending full update
-        if self.stretch_update_timer is not None:
-            self.root.after_cancel(self.stretch_update_timer)
-            self.stretch_update_timer = None
-        # Debounced: Schedule full reload of loaded images after 500ms of no change
-        self.stretch_update_timer = self.root.after(500, self.apply_stretch_settings)
-
-    def apply_stretch_settings(self):
-        """Reload only already loaded display images with new stretch settings (debounced, selective)."""
-        self.stretch_update_timer = None
-        if not self.raw_files:
-            return
-        total = len(self.raw_files)
-        # Only update already loaded images (not None) to avoid full preload
-        loaded_indices = [i for i in range(total) if self.display_pil_images[i] is not None]
-        if not loaded_indices:
-            self.update_status("No images loaded yet.")
-            return
-        self.update_status(f"Updating {len(loaded_indices)} loaded images with new stretch settings...")
-        self.progress_var.set(0)
-        for j, i in enumerate(loaded_indices):
-            self.load_display_image(i, force_reload=True)
-            self.progress_var.set((j + 1) / len(loaded_indices) * 100)
-            self.root.update_idletasks()
-        self.progress_var.set(100)
-        # Refresh current image display
-        if self.current_idx < total and self.display_pil_images[self.current_idx] is not None:
-            self.show_current_image()
-        self.update_status(f"Stretch settings applied to {len(loaded_indices)} images. (New params will apply to unloaded on load.)")
-
-    def on_align_mode_change(self, *args):
-        mode = self.align_mode.get()
-        if mode == "comet":
-            self.transform_mode.set("euclidean")  # Force rigid for comet (no scale)
-            print("Comet mode: switched to euclidean (translation + rotation only)")
-        self.update_samples_ui()  # Dynamic update indicators
-        req_text = "complete comet annotation (Coma + Tail)" if mode == "comet" else "3 points"
-        self.ref_checkbox.config(text=f"Set current as reference (requires {req_text})")
-        # Redraw if images loaded
-        if self.raw_files and self.current_idx < len(self.raw_files):
-            self.redraw_points()
-            self.update_indicators()
-
-    def update_samples_ui(self):
-        mode = self.align_mode.get()
-        # Clear existing
-        for widget in self.samples_subframe.winfo_children():
-            widget.destroy()
-        self.indicators.clear()
-        # Create new based on mode (compact: smaller frames)
-        if mode == "stars":
-            for i in range(3):
-                ind_frame = tk.Frame(self.samples_subframe, width=15, height=15, bg="red")
-                ind_frame.pack(pady=0)
-                ind_label = ttk.Label(self.samples_subframe, text=f"P{i+1}")
-                ind_label.pack()
-                self.indicators.append({'frame': ind_frame, 'label': ind_label, 'index': i})
-        else:  # comet
-            # Coma indicator
-            coma_frame = tk.Frame(self.samples_subframe, width=15, height=15, bg="red")
-            coma_frame.pack(pady=0)
-            coma_label = ttk.Label(self.samples_subframe, text="Coma")
-            coma_label.pack()
-            self.indicators.append({'frame': coma_frame, 'label': coma_label, 'part': 'coma'})
-            # Tail indicator
-            tail_frame = tk.Frame(self.samples_subframe, width=15, height=15, bg="red")
-            tail_frame.pack(pady=0)
-            tail_label = ttk.Label(self.samples_subframe, text="Tail")
-            tail_label.pack()
-            self.indicators.append({'frame': tail_frame, 'label': tail_label, 'part': 'tail'})
-        # Update colors immediately
-        self.update_indicators()
-        print(f"Updated samples UI for {mode} mode")
-
-    def update_indicators(self):
-        mode = self.align_mode.get()
-        if self.current_idx >= len(self.raw_files):
-            return
-        if mode == "stars":
-            points = self.points_list[self.current_idx]
-            is_valid = len(points) == 3 and check_collinearity(points)
-            for i in range(min(3, len(self.indicators))):
-                ind = self.indicators[i]
-                if len(points) > i:
-                    ind['frame'].config(bg="green" if is_valid else "yellow")
-                else:
-                    ind['frame'].config(bg="red")
-        else:  # comet
-            ann = self.comet_ann[self.current_idx]
-            if ann is None:
-                for ind in self.indicators:
-                    ind['frame'].config(bg="red")
-                return
-            cx, cy = ann["center"]
-            r = ann.get("radius", 0.0)
-            if r <= 0:
-                r = 20.0  # Fallback for old files
-                ann["radius"] = r
-            tx, ty = ann["tail_dir"]
-            vec_len = math.hypot(tx - cx, ty - cy)
-            # Coma: green if center and radius >0
-            coma_ind = next((ind for ind in self.indicators if ind.get('part') == 'coma'), None)
-            if coma_ind:
-                if r > 0.0:
-                    coma_ind['frame'].config(bg="green")
-                else:
-                    coma_ind['frame'].config(bg="red")
-            # Tail: green >10px, yellow 1-10px, red <=1px
-            tail_ind = next((ind for ind in self.indicators if ind.get('part') == 'tail'), None)
-            if tail_ind:
-                if vec_len > 10.0:
-                    tail_ind['frame'].config(bg="green")
-                elif vec_len > 1.0:
-                    tail_ind['frame'].config(bg="yellow")
-                else:
-                    tail_ind['frame'].config(bg="red")
-
-    def clear_current_points(self):
-        mode = self.align_mode.get()
-        if mode == "stars":
-            self.points_list[self.current_idx] = []
-            self.save_points_to_file(self.input_dir)
-        else:
-            self.comet_ann[self.current_idx] = None
-            self.save_comet_annotations(self.input_dir)
-        self.redraw_points()
-        self.update_indicators()
-        print(f"Cleared {mode} annotation for image {self.current_idx}")
-        if self.ref_idx == self.current_idx:
-            self.set_ref_var.set(False)
-            self.ref_label.config(text="None selected")
-            self.ref_idx = None
-
-    def on_set_ref(self):
-        mode = self.align_mode.get()
-        if mode == "stars":
-            points = self.points_list[self.current_idx]
-            if len(points) != 3 or not check_collinearity(points):
-                messagebox.showwarning("Warning", "Current image must have exactly 3 non-collinear points to set as reference.")
-                self.set_ref_var.set(False)
-                return
-        else:  # comet
-            ann = self.comet_ann[self.current_idx]
-            if ann is None or not is_valid_comet_ann(ann):
-                messagebox.showwarning("Warning", "Current image must have valid comet annotation (radius >0, tail >10px) to set as reference.")
-                self.set_ref_var.set(False)
-                return
-        if self.set_ref_var.get():
-            self.ref_idx = self.current_idx
-            base_name = os.path.basename(self.raw_files[self.current_idx]) if self.raw_files else f"Image {self.current_idx}"
-            self.ref_label.config(text=f"Selected: {base_name} (index {self.current_idx})")
-            print(f"Set reference to image {self.current_idx} ({mode} mode)")
-            if mode == "stars":
-                self.save_points_to_file(self.input_dir)
-            else:
-                self.save_comet_annotations(self.input_dir)
-        else:
-            self.ref_idx = None
-            self.ref_label.config(text="None selected")
-            print("Reference deselected")
-            if mode == "stars":
-                self.save_points_to_file(self.input_dir)
-            else:
-                self.save_comet_annotations(self.input_dir)
-
-    def schedule_preload(self):
-        if self.preload_active:
-            return
-        if not self.raw_files or self.current_idx >= len(self.raw_files) - 1:
-            return
-        next_start = self.current_idx + 1
-        next_end = min(next_start + 10, len(self.raw_files))
-        unloaded = [i for i in range(next_start, next_end) if i < len(self.display_pil_images) and self.display_pil_images[i] is None]
-        if unloaded:
-            self.preload_active = True
-            threading.Thread(target=self._preload_batch, args=(unloaded,), daemon=True).start()
-
-    def _preload_batch(self, indices):
-        for idx in indices:
-            if idx < len(self.display_pil_images) and self.display_pil_images[idx] is None:
-                self.load_display_image(idx)
-        self.root.after(0, lambda: setattr(self, 'preload_active', False))
-
-    def load_display_image(self, idx, force_reload=False):
-        if idx >= len(self.raw_files):
-            return
-        file_path = self.raw_files[idx]
-        # Skip if already loaded and not forcing reload
-        if not force_reload and self.display_pil_images[idx] is not None:
-            return
-        try:
-            filename = os.path.basename(file_path).lower()
-            if is_raw_file(filename):
-                with rawpy.imread(file_path) as raw:
-                    rgb = raw.postprocess(gamma=(1,1), no_auto_bright=True, output_bps=8, bright=10.0,
-                                          half_size=True, use_camera_wb=True, output_color=rawpy.ColorSpace.sRGB)
-                    print(f"Loaded display for {os.path.basename(file_path)}: min={np.min(rgb)}, max={np.max(rgb)}")
-                    # Set scale for RAW: half_size=True means display is half original
-                    self.display_scales[idx] = 0.5
-            else:
-                img = Image.open(file_path)
-                if img.mode != 'RGB':
-                    img = img.convert('RGB')
-                rgb = np.array(img)
-                if rgb.dtype != np.uint8:
-                    rgb = np.clip(rgb / np.iinfo(rgb.dtype).max * 255, 0, 255).astype(np.uint8)
-                # Set scale for non-RAW: full size
-                self.display_scales[idx] = 1.0
-            stretched = autostretch_image(rgb, self.stretch_factor, self.black_clip)
-            self.display_pil_images[idx] = Image.fromarray(stretched)
-        except Exception as e:
-            print(f"Error loading display {file_path}: {e}")
-            self.display_pil_images[idx] = Image.fromarray(np.zeros((100, 100, 3), dtype=np.uint8) + 128)
-            # Default to 1.0 if error
-            self.display_scales[idx] = 1.0
-
-    def load_raw_image(self, filepath):
-        filename = os.path.basename(filepath).lower()
-        try:
-            if is_raw_file(filename):
-                with rawpy.imread(filepath) as raw:
-                    rgb = raw.postprocess(
-                        gamma=(1, 1),
-                        no_auto_bright=True,
-                        output_bps=16,
-                        use_camera_wb=True,
-                        half_size=False
-                    )
-                    mono = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-                    return mono.astype(np.float32)
-            else:
-                # Load color via PIL for flexibility (handles 8/16-bit PNG/JPG)
-                img = Image.open(filepath).convert('RGB')
-                arr = np.array(img)
-                if arr.dtype == np.uint8:
-                    # Upscale 8-bit to 16-bit range
-                    color_16 = (arr.astype(np.float32) / 255.0 * 65535).astype(np.uint16)
-                else:
-                    # Assume uint16
-                    color_16 = arr.astype(np.uint16)
-                mono = cv2.cvtColor(color_16, cv2.COLOR_RGB2GRAY)
-                return mono.astype(np.float32)
-        except Exception as e:
-            print(f"Error loading RAW for alignment: {os.path.basename(filepath)}, {e}")
-            return None
-
-    def _preload_raws(self):
-        if self.raw_cache is None or len(self.raw_cache) != len(self.raw_files):
-            return
-        for i in range(len(self.raw_files)):
-            if self.raw_cache[i] is None:
-                self.raw_cache[i] = self.load_raw_image(self.raw_files[i])
-        self.root.after(0, lambda: self.update_status("Raw data preloaded."))
-
-    def load_points_from_file(self, directory):
-        if not directory:
-            return 0, 0
-        points_file = os.path.join(directory, "alignment_points.txt")
-        if not os.path.exists(points_file):
-            print("Points file not found: alignment_points.txt")
-            return 0, 0
-        loaded_images = 0
-        total_points = 0
-        current_basename = None
-        current_points = []
-        print(f"Loading points from {points_file}")
-        with open(points_file, 'r') as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    if current_basename and len(current_points) == 3 and check_collinearity(current_points):
-                        for idx, file_path in enumerate(self.raw_files):
-                            basename_match = os.path.splitext(os.path.basename(file_path))[0]
-                            if basename_match == current_basename:
-                                self.points_list[idx] = current_points[:3]
-                                loaded_images += 1
-                                total_points += 3
-                                print(f"Loaded points for {current_basename} at index {idx}")
-                                break
-                    current_basename = None
-                    current_points = []
-                    continue
-                if current_basename is None:
-                    current_basename = line
-                else:
-                    parts = line.split()
-                    if len(parts) == 2:
-                        try:
-                            x = float(parts[0])
-                            y = float(parts[1])
-                            if len(current_points) < 3:
-                                current_points.append([x, y])
-                        except ValueError:
-                            pass
-        # Handle last entry
-        if current_basename and len(current_points) == 3 and check_collinearity(current_points):
-            for idx, file_path in enumerate(self.raw_files):
-                basename_match = os.path.splitext(os.path.basename(file_path))[0]
-                if basename_match == current_basename:
-                    self.points_list[idx] = current_points
-                    loaded_images += 1
-                    total_points += 3
-                    print(f"Loaded points for {current_basename} at index {idx}")
-                    break
-        print(f"Loaded {loaded_images} images with {total_points} points total")
-        return loaded_images, total_points
-
-    def load_comet_from_file(self, directory, try_transformed=False):
-        if not directory:
-            return 0
-        loaded = 0
-        files_to_try = ["comet_annotations.txt"]
-        if try_transformed:
-            files_to_try.append("transformed_comet_annotations.txt")
-        for filename in files_to_try:
-            comet_file = os.path.join(directory, filename)
-            if not os.path.exists(comet_file):
-                print(f"Comet file not found: {filename}")
-                continue
-            print(f"Loading comet annotations from {comet_file}")
-            with open(comet_file, 'r') as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    parts = line.split()
-                    if len(parts) >= 6:  # basename cx cy r tx ty
-                        basename = parts[0]
-                        try:
-                            cx = float(parts[1])
-                            cy = float(parts[2])
-                            r = max(float(parts[3]), 0.0)  # Ensure r >=0
-                            tx = float(parts[4])
-                            ty = float(parts[5])
-                            vec_len = math.hypot(tx - cx, ty - cy)
-                            if vec_len < 1.0:
-                                print(f"Warning: Invalid tail length {vec_len} for {basename}, skipping")
-                                continue
-                            for idx, file_path in enumerate(self.raw_files):
-                                basename_match = os.path.splitext(os.path.basename(file_path))[0]
-                                if basename_match == basename or (filename.endswith("transformed") and basename_match + "_aligned" == basename):
-                                    self.comet_ann[idx] = {"center": (cx, cy), "radius": r, "tail_dir": (tx, ty)}
-                                    loaded += 1
-                                    print(f"Loaded comet for {basename} at index {idx}: r={r:.1f}, tail_len={vec_len:.1f}")
-                                    break
-                        except (ValueError, IndexError) as e:
-                            print(f"Invalid line in comet file {filename}: {line} ({e})")
-                            pass
-            if loaded > 0:
-                break  # Stop if loaded from first file
-        print(f"Loaded {loaded} comet annotations total")
-        return loaded
-
-    def save_points_to_file(self, out_dir=None, transformed_points=None):
-        if out_dir is None:
-            out_dir = self.input_dir
-        if not out_dir:
-            return
-        points_file = os.path.join(out_dir, "alignment_points.txt")
-        with open(points_file, 'w') as f:
-            for idx, points in enumerate(self.points_list):
-                if len(points) != 3 or not check_collinearity(points):
-                    continue
-                basename = os.path.splitext(os.path.basename(self.raw_files[idx]))[0]
-                f.write(f"{basename}\n")
-                for pt in points:
-                    f.write(f"{pt[0]:.2f} {pt[1]:.2f}\n")
-                f.write("\n")
-        print(f"Original points saved to {points_file}")
-        if transformed_points is not None:
-            trans_file = os.path.join(out_dir, "transformed_points.txt")
-            with open(trans_file, 'w') as f:
-                for idx in transformed_points:
-                    if transformed_points[idx] is None or len(transformed_points[idx]) != 3:
-                        continue
-                    basename = os.path.splitext(os.path.basename(self.raw_files[idx]))[0] + "_aligned"
-                    f.write(f"{basename}\n")
-                    for pt in transformed_points[idx]:
-                        f.write(f"{pt[0]:.2f} {pt[1]:.2f}\n")
-                    f.write("\n")
-            print(f"Transformed points saved to {trans_file}")
-
-    def save_comet_annotations(self, out_dir=None, ann_dict=None):
-        if out_dir is None:
-            out_dir = self.input_dir
-        if not out_dir:
-            return
-        if ann_dict is None:
-            ann_dict = self.comet_ann
-        if all(a is None for a in ann_dict) if isinstance(ann_dict, (list, tuple)) else all(v is None for v in ann_dict.values() if isinstance(ann_dict, dict)):
-            return  # Skip if no annotations
-        is_dict = isinstance(ann_dict, dict)
-        idxs = sorted(ann_dict.keys()) if is_dict else range(len(ann_dict))
-        filename = "comet_annotations.txt" if out_dir == self.input_dir else "transformed_comet_annotations.txt"
-        file_path = os.path.join(out_dir, filename)
-        with open(file_path, 'w') as f:
-            for idx in idxs:
-                ann = ann_dict.get(idx) if is_dict else ann_dict[idx]
-                if ann is None:
-                    continue
-                basename = os.path.splitext(os.path.basename(self.raw_files[idx]))[0]
-                if filename.endswith("transformed"):
-                    basename += "_aligned"
-                cx, cy = ann["center"]
-                r = ann.get("radius", 20.0)
-                tx, ty = ann["tail_dir"]
-                f.write(f"{basename} {cx:.2f} {cy:.2f} {r:.2f} {tx:.2f} {ty:.2f}\n")
-        print(f"Comet annotations saved to {file_path}")
-
-    def load_directory(self):
-        directory = filedialog.askdirectory(title="Select Directory (RAW/PNG/JPG)")
-        if not directory:
-            self.update_status("Load cancelled.")
-            return
-        self.reset_data()
-        self.input_dir = directory
-        self.progress_var.set(0)
-        self.update_status("Scanning directory...")
-        self.root.update_idletasks()
-        extensions = ('.dng', '.cr2', '.cr3', '.png', '.jpg', '.jpeg')
-        raw_files = [os.path.join(directory, f) for f in os.listdir(directory) if f.lower().endswith(extensions)]
-        raw_files.sort(key=lambda x: os.path.splitext(os.path.basename(x))[0].lower())
-        if not raw_files:
-            messagebox.showerror("Error", "No supported files (DNG, CR2, CR3, PNG, JPG, JPEG) found in directory.")
-            self.update_status("Ready")
-            return
-        self.finalize_loading(raw_files)
-
-    def finalize_loading(self, raw_files):
-        total_files = len(raw_files)
-        self.raw_files = raw_files
-        self.display_pil_images = [None] * total_files
-        self.points_list = [[] for _ in raw_files]
-        self.comet_ann = [None] * total_files
-        self.current_idx = 0
-        self.ref_idx = None  # Will restore below if valid
-        self.ref_label.config(text="None selected")
-        self.set_ref_var.set(False)
-        self.raw_cache = [None] * total_files
-        self.display_scales = [1.0] * total_files  # Default to 1.0, updated per image on load
-        # Load existing annotations (stars first, then comet)
-        loaded_points, total_points = self.load_points_from_file(self.input_dir)
-        loaded_comet = self.load_comet_from_file(self.input_dir, try_transformed=True)  # Try transformed if main empty
-        load_msg = f"Loaded {loaded_points} stars images with {total_points} points, {loaded_comet} comet annotations."
-        print(load_msg)
-        # Restore reference if possible (check current or first valid)
-        mode = self.align_mode.get()
-        if mode == "stars":
-            for idx in range(total_files):
-                if len(self.points_list[idx]) == 3 and check_collinearity(self.points_list[idx]):
-                    self.ref_idx = idx
-                    self.set_ref_var.set(True)
-                    base_name = os.path.basename(self.raw_files[idx])
-                    self.ref_label.config(text=f"Restored: {base_name} (index {idx})")
-                    print(f"Restored stars reference: {idx}")
-                    break
-        else:  # comet
-            for idx in range(total_files):
-                if self.comet_ann[idx] is not None and is_valid_comet_ann(self.comet_ann[idx]):
-                    self.ref_idx = idx
-                    self.set_ref_var.set(True)
-                    base_name = os.path.basename(self.raw_files[idx])
-                    self.ref_label.config(text=f"Restored: {base_name} (index {idx})")
-                    print(f"Restored comet reference: {idx}")
-                    break
-        # Recreate indicators after loading (since reset destroyed them)
-        self.update_samples_ui()
-        # Update indicators to reflect loaded data
-        self.update_indicators()
-        # Force redraw for current image if annotations loaded
-        if self.raw_files:
-            self.redraw_points()
-        self.update_status(f"Pre-loading first 10 display images...")
-        num_preload = min(10, total_files)
-        if num_preload > 0:
-            self.progress_var.set(0)
-            for i in range(num_preload):
-                self.load_display_image(i)
-                self.progress_var.set(((i + 1) / num_preload) * 100)
-                self.root.update_idletasks()
-            self.progress_var.set(100)
-        self.update_status("Pre-loading raw data in background...")
-        threading.Thread(target=self._preload_raws, daemon=True).start()
-        self.show_current_image()
-        self.current_label.config(text=f"Image {self.current_idx + 1}/{total_files}")
-        self.update_status(f"Ready. {load_msg}")
-        self.root.after(1000, self.schedule_preload)
-
-    def update_status(self, text):
-        self.status_label.config(text=text)
-
-    def show_current_image(self):
-        if not self.display_pil_images or self.current_idx >= len(self.display_pil_images):
-            self.title_label.config(text="No image loaded")
-            self.update_status("Image not loaded")
-            return
-        if self.display_pil_images[self.current_idx] is None:
-            self.update_status(f"Loading image {self.current_idx}...")
-            self.load_display_image(self.current_idx)
-            if self.display_pil_images[self.current_idx] is None:
-                self.title_label.config(text="Failed to load image")
-                self.update_status("Image load failed")
-                return
-        self.root.update_idletasks()
-        self.canvas.update_idletasks()
-        img = self.display_pil_images[self.current_idx]
-        self.title_label.config(text=os.path.basename(self.raw_files[self.current_idx]))
-        self.current_label.config(text=f"Image {self.current_idx + 1}/{len(self.raw_files)}")
-        self.update_status("Ready")
-        self.canvas.delete("all")
-        self.image_item = None
-        canvas_w = self.canvas.winfo_width()
-        canvas_h = self.canvas.winfo_height()
-        if canvas_w <= 1 or canvas_h <= 1:
-            self.root.after(100, self.show_current_image)
-            return
-        img_w, img_h = img.size
-        self.current_img_w = float(img_w)
-        self.current_img_h = float(img_h)
-        is_new_image = self.current_idx != self.last_shown_idx
-        self.last_shown_idx = self.current_idx
-        do_center = False
-        if is_new_image:
-            if not self.initial_fit_done:
-                fit_scale = min((canvas_w * 0.9 / img_w), (canvas_h * 0.9 / img_h))
-                self.zoom_factor = fit_scale
-                self.initial_fit_done = True
-                do_center = True
-                print(f"Initial auto-fit: scale={self.zoom_factor:.3f}")
-        scaled_width = int(img_w * self.zoom_factor)
-        scaled_height = int(img_h * self.zoom_factor)
-        if scaled_width > 0 and scaled_height > 0:
-            scaled_img = img.resize((scaled_width, scaled_height), Image.Resampling.LANCZOS)
-            self.photo = ImageTk.PhotoImage(scaled_img)
-            self.image_item = self.canvas.create_image(self.offset_x, self.offset_y, image=self.photo, anchor=tk.NW, tags="image")
-            self.current_scaled_w = float(scaled_width)
-            self.current_scaled_h = float(scaled_height)
-            self._update_display_position(do_center=do_center)
-            self.redraw_points()
-            self.update_indicators()
-        self.root.after(0, self.schedule_preload)
-
-    def update_scaled_image(self):
-        if not self.display_pil_images or self.current_idx >= len(self.display_pil_images):
-            return
-        if self.display_pil_images[self.current_idx] is None:
-            return
-        img = self.display_pil_images[self.current_idx]
-        img_w, img_h = img.size
-        scaled_width = int(img_w * self.zoom_factor)
-        scaled_height = int(img_h * self.zoom_factor)
-        if scaled_width > 0 and scaled_height > 0:
-            scaled_img = img.resize((scaled_width, scaled_height), Image.Resampling.LANCZOS)
-            self.photo = ImageTk.PhotoImage(scaled_img)
-            if self.image_item:
-                self.canvas.itemconfig(self.image_item, image=self.photo)
-            self.current_scaled_w = float(scaled_width)
-            self.current_scaled_h = float(scaled_height)
-            self._update_scrollregion()
-            self.redraw_points()
-
-    def on_canvas_resize(self, event):
-        if event.widget != self.canvas or event.width < 1 or event.height < 1:
-            return
-        self.update_scaled_image()
-        # Re-center if image smaller than new canvas size (optional, for better UX)
-        canvas_w = self.canvas.winfo_width()
-        canvas_h = self.canvas.winfo_height()
-        if self.current_scaled_w < canvas_w or self.current_scaled_h < canvas_h:
-            self._update_display_position(do_center=True)
-
-    def on_mousewheel(self, event):
-        self.zoom_image(event)
-
-    def zoom_image(self, event):
-        if self.image_item is None or self.current_scaled_w <= 0:
-            return
-        canvas_w = self.canvas.winfo_width()
-        canvas_h = self.canvas.winfo_height()
-        if canvas_w <= 1 or canvas_h <= 1:
-            return
-        old_zoom = self.zoom_factor
-        mouse_canvas_x = event.x
-        mouse_canvas_y = event.y
-        # Image-relative position before zoom
-        mouse_img_x = (mouse_canvas_x - self.offset_x) / old_zoom
-        mouse_img_y = (mouse_canvas_y - self.offset_y) / old_zoom
-        # Apply zoom factor
-        factor = 1.2 if event.delta > 0 else 1 / 1.2
-        new_zoom = old_zoom * factor
-        self.zoom_factor = max(0.1, min(10.0, new_zoom))
-        # Update scaled image
-        self.update_scaled_image()
-        # Adjust offset to keep mouse_img point under cursor
-        new_offset_x = mouse_canvas_x - mouse_img_x * self.zoom_factor
-        new_offset_y = mouse_canvas_y - mouse_img_y * self.zoom_factor
-        self.offset_x = new_offset_x
-        self.offset_y = new_offset_y
-        if self.image_item:
-            self.canvas.coords(self.image_item, self.offset_x, self.offset_y)
-        self._update_scrollregion()
-        self.redraw_points()
-
-    def start_pan(self, event):
-        self.is_panning = True
-        self.pan_start_x = event.x
-        self.pan_start_y = event.y
-        self.pan_start_offset_x = self.offset_x
-        self.pan_start_offset_y = self.offset_y
-
-    def pan(self, event):
-        if self.is_panning:
-            dx = event.x - self.pan_start_x
-            dy = event.y - self.pan_start_y
-            self.offset_x = self.pan_start_offset_x + dx
-            self.offset_y = self.pan_start_offset_y + dy
-            if self.image_item:
-                self.canvas.coords(self.image_item, self.offset_x, self.offset_y)
-            self._update_scrollregion()
-            self.redraw_points()  # Redraw points during pan for smooth feedback
-
-    def stop_pan(self, event):
-        self.is_panning = False
-
-    def redraw_points(self):
-        self.canvas.delete("point")
-        if not self.image_item or self.current_idx >= len(self.raw_files):
-            return
-        mode = self.align_mode.get()
-        current_scale = self.display_scales[self.current_idx] if self.current_idx < len(self.display_scales) else 1.0
-        if mode == "stars":
-            points = self.points_list[self.current_idx]
-            if len(points) == 0:
-                return
-            arm_length = 8.0
-            text_offset = 12.0
-            for i, pt in enumerate(points):
-                if len(pt) == 2:
-                    display_pt_x = pt[0] * current_scale
-                    display_pt_y = pt[1] * current_scale
-                    content_x = self.offset_x + display_pt_x * self.zoom_factor
-                    content_y = self.offset_y + display_pt_y * self.zoom_factor
-                    self.canvas.create_line(content_x - arm_length, content_y, content_x + arm_length, content_y, fill="lime", width=1, tags="point")
-                    self.canvas.create_line(content_x, content_y - arm_length, content_x, content_y + arm_length, fill="lime", width=1, tags="point")
-                    self.canvas.create_text(content_x + text_offset, content_y, text=f"P{i+1}", fill="lime", anchor=tk.W, tags="point", font=("Arial", 10, "bold"))
-            if len(points) == 3:
-                self.save_points_to_file(self.input_dir)
-        else:  # comet
-            ann = self.comet_ann[self.current_idx]
-            if ann:
-                cx, cy = ann["center"]
-                r = ann.get("radius", 20.0)  # Fallback
-                ann["radius"] = r
-                tx, ty = ann["tail_dir"]
-                display_cx = cx * current_scale
-                display_cy = cy * current_scale
-                display_tx = tx * current_scale
-                display_ty = ty * current_scale
-                display_r = r * current_scale
-                content_cx = self.offset_x + display_cx * self.zoom_factor
-                content_cy = self.offset_y + display_cy * self.zoom_factor
-                content_tx = self.offset_x + display_tx * self.zoom_factor
-                content_ty = self.offset_y + display_ty * self.zoom_factor
-                # Circle for coma
-                self.canvas.create_oval(content_cx - display_r * self.zoom_factor, content_cy - display_r * self.zoom_factor,
-                                        content_cx + display_r * self.zoom_factor, content_cy + display_r * self.zoom_factor,
-                                        outline="green", width=2, tags="point")
-                # Line for tail
-                self.canvas.create_line(content_cx, content_cy, content_tx, content_ty, fill="blue", width=3, tags="point")
-                # Cross at center
-                arm = 8 * self.zoom_factor
-                self.canvas.create_line(content_cx - arm, content_cy, content_cx + arm, content_cy, fill="lime", width=1, tags="point")
-                self.canvas.create_line(content_cx, content_cy - arm, content_cx, content_cy + arm, fill="lime", width=1, tags="point")
-                # Labels
-                self.canvas.create_text(content_cx + 12 * self.zoom_factor, content_cy, text="C", fill="lime", anchor=tk.W, tags="point", font=("Arial", 10, "bold"))
-                self.canvas.create_text(content_tx + 12 * self.zoom_factor, content_ty, text="T", fill="blue", anchor=tk.W, tags="point", font=("Arial", 10, "bold"))
-                self.save_comet_annotations(self.input_dir)
-
-    def on_click(self, event):
-        mode = self.align_mode.get()
-        if self.current_idx >= len(self.raw_files) or self.display_pil_images[self.current_idx] is None or self.current_scaled_w <= 0:
-            return
-        img_w = self.current_img_w
-        img_h = self.current_img_h
-        if img_w <= 0 or img_h <= 0:
-            return
-        mouse_content_x = event.x  # Fixed view, so canvasx = x
-        mouse_content_y = event.y
-        rel_x = mouse_content_x - self.offset_x
-        rel_y = mouse_content_y - self.offset_y
-        if not (0 <= rel_x <= self.current_scaled_w and 0 <= rel_y <= self.current_scaled_h):
-            return  # Click outside image - ignore
-        display_orig_x = rel_x / self.zoom_factor
-        display_orig_y = rel_y / self.zoom_factor
-        display_orig_x = max(0.0, min(display_orig_x, img_w - 1))
-        display_orig_y = max(0.0, min(display_orig_y, img_h - 1))
-        current_scale = self.display_scales[self.current_idx] if self.current_idx < len(self.display_scales) else 1.0
-        full_orig_x = display_orig_x / current_scale
-        full_orig_y = display_orig_y / current_scale
-        if mode == "stars":
-            points = self.points_list[self.current_idx]
-            if len(points) < 3:
-                points.append([full_orig_x, full_orig_y])
-                self.redraw_points()
-                self.update_indicators()
-                if len(points) == 3 and self.ref_idx == self.current_idx and not self.set_ref_var.get():
-                    if check_collinearity(points):
-                        self.set_ref_var.set(True)
-                        self.on_set_ref()
-                    else:
-                        messagebox.showwarning("Warning", "Points are collinear—spread them out for stable alignment.")
-                return
-            else:
-                display_points = [[p[0] * current_scale, p[1] * current_scale] for p in points]
-                distances = [math.hypot(display_orig_x - dp[0], display_orig_y - dp[1]) for dp in display_points]
-                min_dist = min(distances)
-                if min_dist < 15.0 / self.zoom_factor:
-                    self.dragged_point_idx = distances.index(min_dist)
-                else:
-                    self.dragged_point_idx = None
-                return
-        else:  # mode == "comet"
-            ann = self.comet_ann[self.current_idx]
-            if ann is None:
-                # Initial click: start with center
-                self._comet_state = "circle_drag"
-                self.temp_comet_center = [full_orig_x, full_orig_y]
-                self.temp_comet_radius = 0.0
-                self.comet_ann[self.current_idx] = {"center": (full_orig_x, full_orig_y), "radius": 0.0, "tail_dir": (full_orig_x, full_orig_y)}
-                self.dragged_comet_part = "center"
-                self.redraw_points()
-                self.update_indicators()
-                return
-            cx, cy = ann["center"]
-            r = ann["radius"]
-            tx, ty = ann["tail_dir"]
-            vec_len = math.hypot(tx - cx, ty - cy)
-            has_tail = vec_len > 1.0
-            cx_display = cx * current_scale
-            cy_display = cy * current_scale
-            r_display = r * current_scale
-            tx_display = tx * current_scale
-            ty_display = ty * current_scale
-            dist_to_center_display = math.hypot(display_orig_x - cx_display, display_orig_y - cy_display)
-            inside_circle = dist_to_center_display <= r_display * 1.5
-            dist_to_tail_end_display = math.hypot(display_orig_x - tx_display, display_orig_y - ty_display)
-            near_tail_end = dist_to_tail_end_display < 30.0
-            if inside_circle:
-                self._comet_state = "drag_center"
-                self.dragged_comet_part = "center"
-                self.temp_comet_center = [cx, cy]
-                if has_tail:
-                    self.temp_tail_end = [tx, ty]
-                self.redraw_points()
-                return
-            elif has_tail and near_tail_end:
-                self._comet_state = "tail_drag"
-                self.dragged_comet_part = "tail"
-                self.temp_tail_end = [tx, ty]
-                self.redraw_points()
-                return
-            elif not has_tail or vec_len < 10.0:
-                if dist_to_center_display > r_display:
-                    self._comet_state = "tail_drag"
-                    self.dragged_comet_part = "tail"
-                    self.temp_tail_end = [full_orig_x, full_orig_y]
-                    ann["tail_dir"] = (full_orig_x, full_orig_y)
-                    self.redraw_points()
-                    return
-                else:
-                    self._comet_state = "drag_center"
-                    self.dragged_comet_part = "center"
-                    self.temp_comet_center = [cx, cy]
-                    self.temp_tail_end = [tx, ty]
-                    self.redraw_points()
-                    return
-            else:
-                return
-
-    def on_point_drag(self, event):
-        mode = self.align_mode.get()
-        if mode == "stars":
-            if self.dragged_point_idx is None or self.current_idx >= len(self.raw_files) or self.display_pil_images[self.current_idx] is None or self.current_scaled_w <= 0:
-                return
-            img_w = self.current_img_w
-            img_h = self.current_img_h
-            if img_w <= 0 or img_h <= 0:
-                return
-            mouse_content_x = event.x
-            mouse_content_y = event.y
-            display_new_x = (mouse_content_x - self.offset_x) / self.zoom_factor
-            display_new_y = (mouse_content_y - self.offset_y) / self.zoom_factor
-            display_new_x = max(0.0, min(display_new_x, img_w - 1))
-            display_new_y = max(0.0, min(display_new_y, img_h - 1))
-            current_scale = self.display_scales[self.current_idx] if self.current_idx < len(self.display_scales) else 1.0
-            full_new_x = display_new_x / current_scale
-            full_new_y = display_new_y / current_scale
-            points = self.points_list[self.current_idx]
-            points[self.dragged_point_idx] = [full_new_x, full_new_y]
-            self.redraw_points()
-            return
-        # Comet drag (updated for fixed view)
-        if self._comet_state not in ["circle_drag", "drag_center", "tail_drag"] or self.dragged_comet_part is None:
-            return
-        img_w = self.current_img_w
-        img_h = self.current_img_h
-        if img_w <= 0 or img_h <= 0:
-            return
-        mouse_content_x = event.x
-        mouse_content_y = event.y
-        display_new_x = (mouse_content_x - self.offset_x) / self.zoom_factor
-        display_new_y = (mouse_content_y - self.offset_y) / self.zoom_factor
-        display_new_x = max(0.0, min(display_new_x, img_w - 1))
-        display_new_y = max(0.0, min(display_new_y, img_h - 1))
-        current_scale = self.display_scales[self.current_idx] if self.current_idx < len(self.display_scales) else 1.0
-        full_new_x = display_new_x / current_scale
-        full_new_y = display_new_y / current_scale
-        ann = self.comet_ann[self.current_idx]
-        if self.dragged_comet_part == "center":
-            if self._comet_state == "circle_drag":
-                dr_x = full_new_x - self.temp_comet_center[0]
-                dr_y = full_new_y - self.temp_comet_center[1]
-                self.temp_comet_radius = max(5.0, math.hypot(dr_x, dr_y))
-                ann["radius"] = self.temp_comet_radius
-            else:
-                dx = full_new_x - ann["center"][0]
-                dy = full_new_y - ann["center"][1]
-                self.temp_comet_center = [full_new_x, full_new_y]
-                new_tx = ann["tail_dir"][0] + dx
-                new_ty = ann["tail_dir"][1] + dy
-                ann["center"] = (full_new_x, full_new_y)
-                ann["tail_dir"] = (new_tx, new_ty)
-            self.redraw_points()
-            self.update_indicators()
-        elif self.dragged_comet_part == "tail":
-            self.temp_tail_end = [full_new_x, full_new_y]
-            ann["tail_dir"] = (full_new_x, full_new_y)
-            self.redraw_points()
-            self.update_indicators()
-
-    def on_point_release(self, event):
-        mode = self.align_mode.get()
-        if mode == "stars":
-            if self.dragged_point_idx is not None:
-                self.dragged_point_idx = None
-                self.redraw_points()
-                self.update_indicators()
-                if len(self.points_list[self.current_idx]) == 3:
-                    self.save_points_to_file(self.input_dir)
-                return
-        # Comet release
-        if self._comet_state in ["circle_drag", "drag_center", "tail_drag"]:
-            ann = self.comet_ann[self.current_idx]
-            if ann is not None:
-                if "radius" in ann and ann["radius"] < 5.0:
-                    ann["radius"] = 5.0
-            self._comet_state = "idle"
-            self.dragged_comet_part = None
-            self.temp_comet_center = None
-            self.temp_comet_radius = 0.0
-            self.temp_tail_end = None
-            self.redraw_points()
-            self.update_indicators()
-            self.save_comet_annotations(self.input_dir)
-
-    def prev_image(self):
-        if self.current_idx > 0:
-            mode = self.align_mode.get()
-            if mode == "stars":
-                self.save_points_to_file(self.input_dir)
-            else:
-                self.save_comet_annotations(self.input_dir)
-            self.current_idx -= 1
-            self.show_current_image()
-
-    def next_image(self):
-        if len(self.raw_files) > 0 and self.current_idx < len(self.raw_files) - 1:
-            mode = self.align_mode.get()
-            if mode == "stars":
-                self.save_points_to_file(self.input_dir)
-            else:
-                self.save_comet_annotations(self.input_dir)
-            self.current_idx += 1
-            self.show_current_image()
-
-    def align_and_save(self):
-        mode = self.align_mode.get()
-        if not self.raw_files:
-            messagebox.showerror("Error", "No images loaded.")
-            return
-        if mode == "comet":
-            if self.ref_idx is None:
-                messagebox.showerror("Error", "No reference image selected (needs comet annotation).")
-                return
-            ref_ann = self.comet_ann[self.ref_idx]
-            if ref_ann is None or not is_valid_comet_ann(ref_ann):
-                messagebox.showerror("Error", "Reference must have valid comet annotation (center + tail).")
-                return
-            ref_triplet = comet_to_triplet(ref_ann)
-            if ref_triplet is None or len(ref_triplet) != 3:
-                messagebox.showerror("Error", "Invalid reference comet: check center and tail direction.")
-                return
-            self.transform_mode.set("euclidean")
-            print("Comet alignment: using rigid transform (center + direction only)")
-        else:
-            if self.ref_idx is None:
-                messagebox.showerror("Error", "No reference image selected.")
-                return
-            ref_points = np.array(self.points_list[self.ref_idx], dtype=np.float32)
-            if len(ref_points) != 3 or not check_collinearity(ref_points):
-                messagebox.showerror("Error", "Reference must have 3 non-collinear points.")
-                return
-        outdir = filedialog.askdirectory(title="Select Output Directory for Aligned FITS")
-        if not outdir:
-            self.update_status("Save cancelled.")
-            return
-        os.makedirs(outdir, exist_ok=True)
-        self.update_status("Starting alignment process...")
-        self.progress_var.set(0)
-        self.root.update_idletasks()
-        ref_filepath = self.raw_files[self.ref_idx]
-        filename = os.path.basename(ref_filepath).lower()
-        try:
-            if is_raw_file(filename):
-                with rawpy.imread(ref_filepath) as raw:
-                    ref_color = raw.postprocess(use_camera_wb=True, output_bps=16, no_auto_bright=True, gamma=(1, 1))
-                    ref_date_obs = extract_raw_date(raw, ref_filepath)
-            else:
-                img = Image.open(ref_filepath).convert('RGB')
-                arr = np.array(img)
-                if arr.dtype == np.uint8:
-                    ref_color = (arr.astype(np.float32) / 255.0 * 65535).astype(np.uint16)
-                else:
-                    ref_color = arr.astype(np.uint16)
-                ref_date_obs = extract_date_from_exif(ref_filepath)
-            ref_mono = cv2.cvtColor(ref_color, cv2.COLOR_RGB2GRAY)
-            print(f"Loaded reference: {os.path.basename(ref_filepath)}")
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to load reference: {e}")
-            self.update_status("Ready.")
-            return
-        ref_size = (ref_mono.shape[1], ref_mono.shape[0])
-        transformed_ann = {} if mode == "comet" else {i: None for i in range(len(self.raw_files))}
-        processed_count = 0
-        skipped_count = 0
-        total_files = len(self.raw_files)
-        for i, filepath in enumerate(self.raw_files):
-            if mode == "comet":
-                src_ann = self.comet_ann[i]
-                if src_ann is None:
-                    print(f"Skipping image {i}: no comet annotation.")
-                    skipped_count += 1
-                    self.progress_var.set((i + 1) / total_files * 100)
-                    self.root.update_idletasks()
-                    continue
-                src_triplet = comet_to_triplet(src_ann)
-                if src_triplet is None or len(src_triplet) != 3:
-                    print(f"Skipping image {i}: invalid comet triplet.")
-                    skipped_count += 1
-                    self.progress_var.set((i + 1) / total_files * 100)
-                    self.root.update_idletasks()
-                    continue
-                src_points, dst_points = src_triplet, ref_triplet
-            else:
-                src_points = np.array(self.points_list[i], dtype=np.float32)
-                if len(src_points) != 3 or not check_collinearity(src_points):
-                    print(f"Skipping image {i}: invalid points.")
-                    skipped_count += 1
-                    self.progress_var.set((i + 1) / total_files * 100)
-                    self.root.update_idletasks()
-                    continue
-                dst_points = ref_points
-            src_filename = os.path.basename(filepath).lower()
-            try:
-                if is_raw_file(src_filename):
-                    with rawpy.imread(filepath) as raw:
-                        src_color = raw.postprocess(use_camera_wb=True, output_bps=16, no_auto_bright=True, gamma=(1, 1))
-                        src_date_obs = extract_raw_date(raw, filepath)
-                else:
-                    img = Image.open(filepath).convert('RGB')
-                    arr = np.array(img)
-                    if arr.dtype == np.uint8:
-                        src_color = (arr.astype(np.float32) / 255.0 * 65535).astype(np.uint16)
-                    else:
-                        src_color = arr.astype(np.uint16)
-                    src_date_obs = extract_date_from_exif(filepath)
-                src_mono = cv2.cvtColor(src_color, cv2.COLOR_RGB2GRAY).astype(np.float32)
-            except Exception as e:
-                print(f"Skipping image {i}: load error {e}")
-                skipped_count += 1
-                self.progress_var.set((i + 1) / total_files * 100)
-                self.root.update_idletasks()
-                continue
-            if i == self.ref_idx:
-                M = np.eye(2, 3, dtype=np.float32)
-            else:
-                try:
-                    M, _ = compute_transform(src_points, dst_points, mode=self.transform_mode.get())
-                    if M is None:
-                        raise ValueError("Transform failed.")
-                except Exception as e:
-                    print(f"Skipping image {i}: transform error {e}")
-                    skipped_count += 1
-                    self.progress_var.set((i + 1) / total_files * 100)
-                    self.root.update_idletasks()
-                    continue
-            aligned_color = cv2.warpAffine(src_color, M, ref_size,
-                                           flags=cv2.INTER_LINEAR,
-                                           borderMode=cv2.BORDER_CONSTANT,
-                                           borderValue=(0, 0, 0))
-            fits_data = np.moveaxis(aligned_color, 2, 0).astype(np.float32)
-            filename = os.path.join(outdir, f"aligned_{i+1:05d}.fit")
-            try:
-                header = fits.Header()
-                if src_date_obs:
-                    header['DATE-OBS'] = src_date_obs
-                    header['CREATED'] = src_date_obs
-                else:
-                    print(f"No DATE-OBS for image {i}.")
-                hdu = fits.PrimaryHDU(data=fits_data, header=header)
-                hdu.writeto(filename, overwrite=True)
-                processed_count += 1
-                print(f"Saved: {filename}")
-                if mode == "comet":
-                    trans_center = transform_points(M, [[src_ann["center"][0], src_ann["center"][1]]])[0]
-                    trans_tail = transform_points(M, [[src_ann["tail_dir"][0], src_ann["tail_dir"][1]]])[0]
-                    transformed_ann[i] = {"center": tuple(trans_center), "radius": src_ann["radius"], "tail_dir": tuple(trans_tail)}
-                else:
-                    transformed_ann[i] = transform_points(M, self.points_list[i])
-            except Exception as e:
-                print(f"Save error for {filename}: {e}")
-                skipped_count += 1
-            self.progress_var.set((i + 1) / total_files * 100)
-            self.root.update_idletasks()
-            del src_color, src_mono, aligned_color, fits_data
-            gc.collect()
-        if mode == "stars":
-            self.save_points_to_file(self.input_dir)
-            self.save_points_to_file(outdir, transformed_ann)
-        else:
-            self.save_comet_annotations(self.input_dir)
-            self.save_comet_annotations(outdir, transformed_ann)
-        del ref_color, ref_mono
-        gc.collect()
-        message = f"Alignment complete!\nProcessed: {processed_count} images.\nSkipped: {skipped_count} images."
-        messagebox.showinfo("Success", message)
-        self.update_status("Ready.")
+class ImageLoaderThread(threading.Thread):
+    
+    def __init__(self, queue, signals, viewer):
+        super().__init__(daemon=True)
+        self.queue = queue
+        self.signals = signals
+        self.viewer = viewer
+        self.running = True
 
     def run(self):
-        self.root.mainloop()
+        while self.running:
+            try:
+                priority, task_id, idx, path, stretch, black = self.queue.get(timeout=0.2)
+                
+                if idx is None:
+                    break
+                
+                arr = self.viewer.load_image_data(path)
+                if arr is None:
+                    self.queue.task_done()
+                    continue
+                
+                self.viewer.raw_cache[idx] = arr
+                
+                pixmap = self.viewer._array_to_pixmap_with_params(arr, stretch, black)
+                if pixmap is not None:
+                    self.signals.pixmap_ready.emit(idx, pixmap)
+                
+                self.queue.task_done()
+            except:
+                pass
+
+    def stop(self):
+        self.running = False
+
+
+class MagnifierOverlay(QWidget):
+
+    def __init__(self, viewer, parent=None):
+        super().__init__(parent or viewer.viewport())
+        self.viewer = viewer
+        self.radius = 110
+        self.zoom = 2.9
+        self.scene_pos = None
+
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setFixedSize(self.diameter, self.diameter)
+
+    @property
+    def diameter(self) -> int:
+        return int(self.radius * 2)
+
+    def set_center_scene_pos(self, scene_pos: QPointF):
+        self.scene_pos = scene_pos
+        self.update()
+
+    def paintEvent(self, event):
+        if self.scene_pos is None:
+            return
+
+        scene = self.viewer._scene
+        if scene is None:
+            return
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        painter.fillRect(self.rect(), Qt.GlobalColor.transparent)
+
+        src_radius = self.radius / self.zoom
+        sx = self.scene_pos.x() - src_radius
+        sy = self.scene_pos.y() - src_radius
+        sw = src_radius * 2
+        sh = src_radius * 2
+        source_rect = QRectF(sx, sy, sw, sh)
+        if source_rect.isEmpty():
+            return
+
+        target_rect = QRectF(0, 0, self.diameter, self.diameter)
+
+        path = QPainterPath()
+        path.addEllipse(target_rect)
+        painter.setClipPath(path)
+
+        scene.render(painter, target_rect, source_rect)
+
+        painter.setClipping(False)
+
+        pen = QPen(QColor(0, 255, 0, 180), 2)
+        painter.setPen(pen)
+        painter.drawEllipse(target_rect.adjusted(0.5, 0.5, -0.5, -0.5))
+
+
+class PhotoViewer(QGraphicsView):
+    pointClicked = pyqtSignal(QPointF)
+    pointDrag = pyqtSignal(QPointF, QPoint)
+    pointRelease = pyqtSignal(QPointF)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        self._scene = QGraphicsScene(self)
+        self._photo = QGraphicsPixmapItem()
+        self._photo.setShapeMode(QGraphicsPixmapItem.ShapeMode.BoundingRectShape)
+        self._scene.addItem(self._photo)
+        self.setScene(self._scene)
+
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setBackgroundBrush(Qt.GlobalColor.black)
+        self.setFrameStyle(0)
+
+        self._empty = True
+        self.setDragMode(QGraphicsView.DragMode.NoDrag)
+        self._last_pos = QPoint()
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+
+        self.fit_scale = 1.0
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
+        self.magnifier = MagnifierOverlay(self, self.viewport())
+        self.magnifier.hide()
+
+    def hasPhoto(self):
+        return not self._empty
+
+    def get_relative_zoom(self):
+        return self.transform().m11() / self.fit_scale if self.fit_scale > 0 else 1.0
+
+    def get_relative_pan(self):
+        scene_rect = self._scene.sceneRect()
+        if scene_rect.isEmpty() or scene_rect.width() == 0 or scene_rect.height() == 0:
+            return 0.5, 0.5
+
+        hbar = self.horizontalScrollBar()
+        vbar = self.verticalScrollBar()
+
+        rel_x = hbar.value() / max(1, hbar.maximum()) if hbar.maximum() > 0 else 0.5
+        rel_y = vbar.value() / max(1, vbar.maximum()) if vbar.maximum() > 0 else 0.5
+        return rel_x, rel_y
+
+    def setPhoto(self, pixmap=None, rel_zoom=1.0, rel_x=0.5, rel_y=0.5):
+        if pixmap and not pixmap.isNull():
+            self._empty = False
+            self._photo.setPixmap(pixmap)
+
+            rect = pixmap.rect()
+            w, h = rect.width(), rect.height()
+
+            pad_x, pad_y = w * 0.1, h * 0.1
+            padded_rect = QRectF(rect).adjusted(-pad_x, -pad_y, pad_x, pad_y)
+            self._scene.setSceneRect(padded_rect)
+
+            view_w = self.viewport().width()
+            view_h = self.viewport().height()
+            new_fit_scale = min(view_w / w, view_h / h) if w > 0 and h > 0 else 1.0
+            self.fit_scale = new_fit_scale
+
+            self.resetTransform()
+            target_scale = new_fit_scale * rel_zoom
+            self.scale(target_scale, target_scale)
+
+            QApplication.processEvents()
+
+            hbar = self.horizontalScrollBar()
+            vbar = self.verticalScrollBar()
+            new_hbar_max = hbar.maximum()
+            new_vbar_max = vbar.maximum()
+            target_h_scroll = int(rel_x * max(0, new_hbar_max))
+            target_v_scroll = int(rel_y * max(0, new_vbar_max))
+            hbar.setValue(target_h_scroll)
+            vbar.setValue(target_v_scroll)
+
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+        else:
+            self._empty = True
+            self._photo.setPixmap(QPixmap())
+            self.resetTransform()
+            self.fit_scale = 1.0
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+
+    def wheelEvent(self, event):
+        if not self.hasPhoto():
+            return
+        factor = 1.25 if event.angleDelta().y() > 0 else 1 / 1.25
+        self.scale(factor, factor)
+        event.accept()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self.hasPhoto():
+            vp_pos = event.position().toPoint()
+            self._update_magnifier(vp_pos)
+
+            scene_pos = self.mapToScene(vp_pos)
+            self.pointClicked.emit(scene_pos)
+            event.accept()
+            return
+
+        elif event.button() == Qt.MouseButton.MiddleButton and self.hasPhoto():
+            self._last_pos = event.position().toPoint()
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+            return
+
+        else:
+            super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if (
+            event.buttons() == Qt.MouseButton.MiddleButton
+            and self.hasPhoto()
+            and not self._last_pos.isNull()
+        ):
+            hbar = self.horizontalScrollBar()
+            vbar = self.verticalScrollBar()
+            delta_x = self._last_pos.x() - event.position().toPoint().x()
+            delta_y = self._last_pos.y() - event.position().toPoint().y()
+            hbar.setValue(hbar.value() + delta_x)
+            vbar.setValue(vbar.value() + delta_y)
+            self._last_pos = event.position().toPoint()
+            event.accept()
+            return
+
+        elif event.buttons() == Qt.MouseButton.LeftButton and self.hasPhoto():
+            vp_pos = event.position().toPoint()
+            scene_pos = self.mapToScene(vp_pos)
+            self.pointDrag.emit(scene_pos, vp_pos)
+            event.accept()
+            return
+
+        else:
+            self.magnifier.hide()
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+            super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self.hasPhoto():
+            self.magnifier.hide()
+            scene_pos = self.mapToScene(event.position().toPoint())
+            self.pointRelease.emit(scene_pos)
+            event.accept()
+            return
+
+        elif event.button() == Qt.MouseButton.MiddleButton:
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+            self._last_pos = QPoint()
+            event.accept()
+            return
+
+        else:
+            super().mouseReleaseEvent(event)
+
+    def leaveEvent(self, event):
+        self.magnifier.hide()
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        super().leaveEvent(event)
+
+    def keyPressEvent(self, event):
+        if event.key() in (
+            Qt.Key.Key_Left,
+            Qt.Key.Key_Right,
+            Qt.Key.Key_Up,
+            Qt.Key.Key_Down,
+        ):
+            event.ignore()
+            return
+        super().keyPressEvent(event)
+
+    def _update_magnifier(self, viewport_pos: QPoint):
+        if not self.hasPhoto():
+            self.magnifier.hide()
+            return
+
+        scene_pos = self.mapToScene(viewport_pos)
+        self.magnifier.set_center_scene_pos(scene_pos)
+
+        d = self.magnifier.diameter
+        offset = 20
+        x = viewport_pos.x() + offset
+        y = viewport_pos.y() + offset
+
+        max_x = self.viewport().width() - d
+        max_y = self.viewport().height() - d
+        x = max(0, min(x, max_x))
+        y = max(0, min(y, max_y))
+
+        self.magnifier.move(x, y)
+        self.magnifier.show()
+        self.magnifier.update()
+
+
+class ImageViewer(QMainWindow):
+    def __init__(self):
+        super().__init__()
+
+        self.settings = QSettings("AstroAligner", "ImageViewer")
+        self.setWindowTitle("AstroAligner")
+        self.resize(1200, 800)
+
+        self.last_dir = self.settings.value("last_directory", os.getcwd())
+        self.current_index = 0
+        self.file_paths = []
+
+        self.cache = {}
+        self.raw_cache = {}
+        self.max_cache_size = 20
+
+        self.stretch_factor = 1.0
+        self.black_level = 0.0
+        
+        self.monochrome = True
+        
+        self.reduce_factor = 1.0
+
+        self.reference_index = None
+        self.align_method = "rotate_shift"
+
+        self.align_file = None
+
+        self.alignment_store = {}
+        self.reference_store = {}
+        
+        self.load_alignment_store()
+        self.load_reference_store()
+
+        print(f"DEBUG: Alignment file init: {self.align_file}")
+        print(f"DEBUG: Reference store init (in-memory): {self.reference_store}")
+
+        self.align_points_items = []
+        self.points_count = 0
+        self.drag_point_index = None
+        self.dragging = False
+
+        self.drag_start_scene = None
+        self.drag_start_img_pos = None
+        self.drag_slow_factor_fine = 0.05
+        self.drag_slow_factor_normal = 1.0
+
+        self.cross_size = 80.0
+
+        self.loader_signals = LoaderSignals()
+        self.loader_signals.pixmap_ready.connect(self.on_pixmap_ready)
+        self.loader_queue = PriorityQueue()
+        self.loader_thread = ImageLoaderThread(self.loader_queue, self.loader_signals, self)
+        self.loader_thread.start()
+        
+        self.queued_indices = set()
+        self.task_counter = 0
+
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        main_layout = QVBoxLayout(central_widget)
+
+        top_panel = QWidget()
+        top_layout = QVBoxLayout(top_panel)
+
+        self.status_label = QLabel("Ready")
+        self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        top_layout.addWidget(self.status_label)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        top_layout.addWidget(self.progress_bar)
+
+        main_layout.addWidget(top_panel)
+
+        content_layout = QHBoxLayout()
+        main_layout.addLayout(content_layout)
+
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+
+        self.load_button = QPushButton("Load working directory")
+        self.load_button.clicked.connect(self.load_directory)
+        left_layout.addWidget(self.load_button)
+
+        # НОВОЕ: Align type (3 Point / Comet only)
+        self.align_type = "3point"  # значение по умолчанию
+
+        align_type_label = QLabel("Align type")
+        left_layout.addWidget(align_type_label)
+
+        self.align_type_combo = QComboBox()
+        self.align_type_combo.addItem("3 Point", userData="3point")
+        self.align_type_combo.addItem("Comet only", userData="comet")
+        self.align_type_combo.setCurrentIndex(0)
+        self.align_type_combo.currentIndexChanged.connect(self.on_align_type_changed)
+        left_layout.addWidget(self.align_type_combo)
+
+        self.current_label = QLabel("No image loaded\n0/0")
+        self.current_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        left_layout.addWidget(self.current_label)
+
+        self.align_indicators = []
+        for text in ["Align point 1", "Align point 2", "Align point 3"]:
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(6)
+            row_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+            circle = QLabel()
+            circle.setFixedSize(14, 14)
+            circle.setStyleSheet(
+                "background-color: red;"
+                "border-radius: 7px;"
+                "border: 1px solid #550000;"
+            )
+
+            label = QLabel(text)
+            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+            row_layout.addWidget(circle)
+            row_layout.addWidget(label)
+            left_layout.addWidget(row, 0, Qt.AlignmentFlag.AlignHCenter)
+
+            self.align_indicators.append(circle)
+
+        self.clear_points_button = QPushButton("Clear points")
+        self.clear_points_button.clicked.connect(self.on_clear_points_clicked)
+        left_layout.addWidget(self.clear_points_button)
+
+        stretch_label = QLabel("Stretch factor")
+        left_layout.addWidget(stretch_label)
+
+        self.stretch_slider = QSlider(Qt.Orientation.Horizontal)
+        self.stretch_slider.setRange(10, 500)
+        self.stretch_slider.setValue(100)
+        self.stretch_slider.sliderMoved.connect(self.on_stretch_slider_changed)
+        left_layout.addWidget(self.stretch_slider)
+
+        black_label = QLabel("Black points")
+        left_layout.addWidget(black_label)
+        self.black_slider = QSlider(Qt.Orientation.Horizontal)
+        self.black_slider.setRange(0, 100)
+        self.black_slider.setValue(0)
+        self.black_slider.sliderMoved.connect(self.on_black_slider_changed)
+        left_layout.addWidget(self.black_slider)
+        
+        self.monochrome_checkbox = QCheckBox("Monochrome")
+        self.monochrome_checkbox.setChecked(True)
+        self.monochrome_checkbox.stateChanged.connect(self.on_monochrome_changed)
+        left_layout.addWidget(self.monochrome_checkbox)
+
+        self.apply_global_button = QPushButton("Apply global")
+        self.apply_global_button.clicked.connect(self.on_apply_global_clicked)
+        left_layout.addWidget(self.apply_global_button)
+        
+        reduce_label = QLabel("Reduce display resolution")
+        left_layout.addWidget(reduce_label)
+        self.reduce_combo = QComboBox()
+        self.reduce_combo.addItem("1x")
+        self.reduce_combo.addItem("2x")
+        self.reduce_combo.addItem("4x")
+        self.reduce_combo.addItem("6x")
+        self.reduce_combo.setCurrentIndex(0)
+        self.reduce_combo.currentTextChanged.connect(self.on_reduce_resolution_changed)
+        left_layout.addWidget(self.reduce_combo)
+
+        self.reference_checkbox = QCheckBox("Reference image")
+        self.reference_checkbox.stateChanged.connect(self.on_reference_checkbox_changed)
+        left_layout.addWidget(self.reference_checkbox)
+
+        align_label = QLabel("Align method")
+        left_layout.addWidget(align_label)
+        self.align_method_combo = QComboBox()
+        self.align_method_combo.addItem("Euclidean", userData="rotate_shift")
+        self.align_method_combo.addItem(
+            "Affine", userData="rotate_shift_scale"
+        )
+        self.align_method_combo.currentIndexChanged.connect(
+            self.on_align_method_changed
+        )
+        left_layout.addWidget(self.align_method_combo)
+
+        self.align_button = QPushButton("Align")
+        self.align_button.clicked.connect(self.on_align_clicked)
+        left_layout.addWidget(self.align_button)
+
+        left_layout.addStretch()
+
+        content_layout.addWidget(left_panel, 1)
+
+        self.viewer = PhotoViewer(self)
+        self.viewer.pointClicked.connect(self.on_point_clicked)
+        self.viewer.pointDrag.connect(self.on_point_drag)
+        self.viewer.pointRelease.connect(self.on_point_release)
+        content_layout.addWidget(self.viewer, 3)
+
+        self.current_dir = None
+
+        screen = QApplication.primaryScreen().availableGeometry()
+        self.move(
+            (screen.width() - self.width()) // 2,
+            (screen.height() - self.height()) // 2,
+        )
+
+        self.viewer.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setFocus()
+
+        self.update_align_indicators()
+
+    def on_pixmap_ready(self, idx: int, pixmap):
+        """Обработчик готового pixmap'а из потока."""
+        self.cache[idx] = pixmap
+        
+        if idx == self.current_index:
+            if self.viewer.hasPhoto():
+                rel_zoom = self.viewer.get_relative_zoom()
+                rel_x, rel_y = self.viewer.get_relative_pan()
+            else:
+                rel_zoom = 1.0
+                rel_x = rel_y = 0.5
+            
+            self.viewer.setPhoto(pixmap, rel_zoom=rel_zoom, rel_x=rel_x, rel_y=rel_y)
+
+    def get_display_scale(self) -> float:
+        """
+        Масштаб уменьшения для отображения.
+        1.0 - без уменьшения, 2.0 - 2x меньше по каждой оси и т.п.
+        """
+        factor = getattr(self, "reduce_factor", 1.0)
+        if factor is None or factor <= 0:
+            factor = 1.0
+        return float(factor)
+        
+    def get_observation_date_for_file(self, img_path: str):
+        """
+        Вернуть дату наблюдения для файла img_path в формате 'YYYY-MM-DDTHH:MM:SS'.
+
+        Приоритет:
+        1) Для FITS — берём DATE-OBS / Observation Date / DATE из заголовка.
+        2) Для RAW/JPEG/PNG/TIFF и т.п. — EXIF DateTimeOriginal.
+        3) Если EXIF нет — время файла (mtime) из файловой системы.
+        """
+        ext = os.path.splitext(img_path)[1].lower()
+
+        # 1. FITS: попробовать вытащить уже существующую дату из заголовка
+        if ext in FITS_EXT and fits is not None:
+            try:
+                hdr = fits.getheader(img_path)
+                for key in ("Observation Date", "DATE-OBS", "DATE"):
+                    val = hdr.get(key)
+                    if val:
+                        # здесь предполагаем, что в заголовке уже подходящий формат
+                        return str(val)
+            except Exception as e:
+                print(f"Не удалось прочитать FITS header {img_path}: {e}")
+
+        # 2. EXIF DateTimeOriginal для RAW / JPEG / др.
+        if exifread is not None:
+            try:
+                with open(img_path, "rb") as f:
+                    tags = exifread.process_file(
+                        f,
+                        stop_tag="EXIF DateTimeOriginal",
+                        details=False,
+                    )
+                dt_tag = tags.get("EXIF DateTimeOriginal") or tags.get("Image DateTime")
+                if dt_tag:
+                    # ожидаемый формат: 'YYYY:MM:DD HH:MM:SS'
+                    s = str(dt_tag).strip()
+                    try:
+                        dt_obj = datetime.strptime(s, "%Y:%m:%d %H:%M:%S")  # EXIF‑формат[web:30]
+                        return dt_obj.strftime("%Y-%m-%dT%H:%M:%S")
+                    except ValueError:
+                        # На крайний случай: грубое преобразование, если формат чуть другой
+                        # первые два ':' меняем на '-', пробел на 'T'
+                        return s.replace(" ", "T").replace(":", "-", 2)
+            except Exception as e:
+                print(f"Не удалось прочитать EXIF из {img_path}: {e}")
+
+        # 3. Fallback — время файла из ОС
+        try:
+            ts = os.path.getmtime(img_path)
+            dt_obj = datetime.fromtimestamp(ts)
+            return dt_obj.strftime("%Y-%m-%dT%H:%M:%S")
+        except Exception as e:
+            print(f"Не удалось получить время файла {img_path}: {e}")
+            return None
+
+    def img_to_display(self, p: QPointF) -> QPointF:
+        """
+        Перевод координат из полного разрешения (array) в координаты pixmap.
+        """
+        s = self.get_display_scale()
+        return QPointF(p.x() / s, p.y() / s)
+
+    def display_to_img(self, p: QPointF) -> QPointF:
+        """
+        Перевод координат из координат pixmap в полное разрешение (array).
+        """
+        s = self.get_display_scale()
+        return QPointF(p.x() * s, p.y() * s)
+        
+    def queue_image_load(self, idx: int, window_size: int = 3):
+        if not self.file_paths or idx < 0 or idx >= len(self.file_paths):
+            return
+        
+        path = self.file_paths[idx]
+        
+        if idx in self.cache and idx in self.raw_cache:
+            return
+        
+        if idx in self.queued_indices:
+            return
+        
+        priority = abs(idx - self.current_index)
+        
+        self.task_counter += 1
+        task_id = self.task_counter
+        
+        self.loader_queue.put((
+            priority,
+            task_id,
+            idx,
+            path,
+            self.stretch_factor,
+            self.black_level
+        ))
+        
+        self.queued_indices.add(idx)
+
+    def refresh_queue_for_position(self, window_size: int = 3):
+        for offset in range(-window_size, window_size + 1):
+            idx = self.current_index + offset
+            if 0 <= idx < len(self.file_paths):
+                self.queue_image_load(idx, window_size)
+        
+        if len(self.cache) > self.max_cache_size:
+            distances = [(abs(idx - self.current_index), idx) for idx in list(self.cache.keys())]
+            distances.sort()
+            to_keep = [idx for _, idx in distances[: self.max_cache_size]]
+            to_remove = set(self.cache.keys()) - set(to_keep)
+            for idx in to_remove:
+                self.cache.pop(idx, None)
+                self.raw_cache.pop(idx, None)
+
+    def load_reference_store(self):
+        self.reference_store = {}
+
+    def save_current_reference(self):
+        if self.current_dir is None or not self.file_paths:
+            return
+
+        if self.reference_index is not None and 0 <= self.reference_index < len(self.file_paths):
+            self.reference_store[self.current_dir] = {
+                "index": self.reference_index,
+                "file_path": self.file_paths[self.reference_index]
+            }
+        else:
+            self.reference_store.pop(self.current_dir, None)
+
+    def load_current_reference(self):
+        if self.current_dir is None:
+            self.reference_index = None
+            return
+
+        if self.current_dir in self.reference_store:
+            ref_data = self.reference_store[self.current_dir]
+            idx = ref_data.get("index")
+            if isinstance(idx, int) and 0 <= idx < len(self.file_paths):
+                self.reference_index = idx
+            else:
+                self.reference_index = None
+        else:
+            self.reference_index = None
+
+    def on_reference_checkbox_changed(self, state: int):
+   
+        if not self.file_paths:
+            self.reference_index = None
+            self.update_reference_checkbox_text()
+            return
+
+        if state == Qt.CheckState.Checked.value or state == 2:
+            self.reference_index = self.current_index
+        else:
+            if self.reference_index == self.current_index:
+                self.reference_index = None
+
+        self.save_current_reference()
+        
+        self.update_reference_checkbox_text()
+        self.update_reference_ui_state()
+
+    def sync_reference_checkbox(self):
+        self.reference_checkbox.blockSignals(True)
+        is_current_reference = (self.reference_index == self.current_index)
+        self.reference_checkbox.setChecked(is_current_reference)
+        self.reference_checkbox.blockSignals(False)
+
+    def update_reference_checkbox_text(self):
+        if self.reference_index is not None and 0 <= self.reference_index < len(self.file_paths):
+            text = f"Reference image (#{self.reference_index + 1})"
+        else:
+            text = "Reference image"
+        
+        self.reference_checkbox.setText(text)
+
+    def update_reference_ui_state(self):
+        if self.reference_index is not None and 0 <= self.reference_index < len(self.file_paths):
+            ref_name = os.path.basename(self.file_paths[self.reference_index])
+            self.status_label.setText(f"Reference: {ref_name}")
+        else:
+            if self.file_paths:
+                self.status_label.setText("Ready")
+            else:
+                self.status_label.setText("Ready")
+                
+    def on_align_type_changed(self, index: int):
+        data = self.align_type_combo.itemData(index)
+        if data in ("3point", "comet"):
+            self.align_type = data
+        else:
+            self.align_type = "3point"
+
+    def on_align_method_changed(self, index: int):
+        data = self.align_method_combo.itemData(index)
+        if data in ("rotate_shift", "rotate_shift_scale"):
+            self.align_method = data
+        else:
+            self.align_method = "rotate_shift"
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Left and self.current_index > 0:
+            self.previous_image()
+            event.accept()
+            return
+        elif (
+            event.key() == Qt.Key.Key_Right
+            and self.current_index < len(self.file_paths) - 1
+        ):
+            self.next_image()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def closeEvent(self, event):
+        self.save_current_image_alignment()
+        self.save_current_reference()
+        self.loader_queue.put((999, 0, None, "", 0, 0))
+        self.loader_thread.stop()
+        super().closeEvent(event)
+
+    def load_alignment_store(self):
+        if not self.align_file or not os.path.exists(self.align_file):
+            self.alignment_store = {}
+            return
+        try:
+            with open(self.align_file, "r", encoding="utf-8") as f:
+                data = f.read().strip()
+                if not data:
+                    self.alignment_store = {}
+                else:
+                    self.alignment_store = json.loads(data)
+        except Exception:
+            self.alignment_store = {}
+
+    def save_alignment_store(self):
+        if not self.align_file:
+            return
+        try:
+            with open(self.align_file, "w", encoding="utf-8") as f:
+                json.dump(self.alignment_store, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            print(f"Не удалось сохранить alignment_points.txt: {e}")
+
+    def get_image_key(self, path: str) -> str:
+        if self.current_dir:
+            try:
+                return os.path.relpath(path, self.current_dir)
+            except Exception:
+                pass
+        return path
+
+    def save_current_image_alignment(self):
+        if not self.file_paths:
+            return
+        if self.current_dir is None:
+            return
+
+        dir_key = self.current_dir
+        img_path = self.file_paths[self.current_index]
+        img_key = self.get_image_key(img_path)
+
+        if dir_key not in self.alignment_store:
+            self.alignment_store[dir_key] = {}
+
+        points_list = []
+        for item in self.align_points_items[: self.points_count]:
+            img_pos = item["img_pos"]
+            points_list.append({"x": img_pos.x(), "y": img_pos.y()})
+
+        if points_list:
+            self.alignment_store[dir_key][img_key] = points_list
+        else:
+            if img_key in self.alignment_store[dir_key]:
+                del self.alignment_store[dir_key][img_key]
+            if not self.alignment_store[dir_key]:
+                del self.alignment_store[dir_key]
+
+        self.save_alignment_store()
+
+    def on_clear_points_clicked(self):
+        self.clear_align_markers()
+
+        if not self.file_paths or self.current_dir is None:
+            return
+
+        dir_key = self.current_dir
+        img_path = self.file_paths[self.current_index]
+        img_key = self.get_image_key(img_path)
+
+        if dir_key in self.alignment_store and img_key in self.alignment_store[dir_key]:
+            del self.alignment_store[dir_key][img_key]
+            if not self.alignment_store[dir_key]:
+                del self.alignment_store[dir_key]
+            self.save_alignment_store()
+
+        self.status_label.setText("Align points cleared for current image")
+
+    def load_image_alignment(self, img_path: str):
+        self.clear_align_markers()
+        if self.current_dir is None:
+            return
+
+        dir_key = self.current_dir
+        if dir_key not in self.alignment_store:
+            return
+
+        img_key = self.get_image_key(img_path)
+        points_data = self.alignment_store[dir_key].get(img_key)
+        if not points_data:
+            return
+
+        for pd in points_data[:3]:
+            img_pos = QPointF(float(pd["x"]), float(pd["y"]))
+            self.add_point_from_image_coords(img_pos)
+
+        self.update_align_indicators()
+
+    def clear_align_markers(self):
+        scene = self.viewer._scene
+        for item in self.align_points_items:
+            for key in (
+                "h_outer_left", "h_outer_right", "h_inner",
+                "v_outer_top", "v_outer_bottom", "v_inner",
+                "circle", "text"
+            ):
+                obj = item.get(key)
+                if obj is not None:
+                    scene.removeItem(obj)
+        self.align_points_items.clear()
+        self.points_count = 0
+        self.drag_point_index = None
+        self.dragging = False
+        self.drag_start_scene = None
+        self.drag_start_img_pos = None
+        self.update_align_indicators()
+
+
+
+    def on_point_clicked(self, scene_pos: QPointF):
+        if not self.viewer.hasPhoto():
+            return
+
+        # Координаты в системе pixmap
+        disp_pos = self.viewer._photo.mapFromScene(scene_pos)
+        # Переводим в координаты полного массива
+        img_pos = self.display_to_img(disp_pos)
+
+        if self.points_count < 3:
+            self.add_point_from_image_coords(img_pos)
+            self.drag_point_index = self.points_count - 1
+            self.dragging = True
+            self.drag_start_scene = scene_pos
+            self.drag_start_img_pos = img_pos   # полные координаты
+            return
+
+        idx = self.find_nearest_point(scene_pos, max_dist=20.0)
+        if idx is not None:
+            self.drag_point_index = idx
+            self.dragging = True
+            self.drag_start_scene = scene_pos
+            self.drag_start_img_pos = self.align_points_items[idx]["img_pos"]
+
+    def on_point_drag(self, scene_pos: QPointF, viewport_pos: QPoint):
+        if not self.viewer.hasPhoto():
+            return
+
+        # Если просто двигаем курсор без активного drag точки — лупа по курсору
+        if not self.dragging or self.drag_point_index is None:
+            center_scene = scene_pos
+            self._update_magnifier_from_viewer(center_scene, viewport_pos)
+            return
+
+        if self.drag_start_scene is None or self.drag_start_img_pos is None:
+            return
+
+        mods = QApplication.keyboardModifiers()
+        fine = bool(mods & Qt.KeyboardModifier.ShiftModifier)
+        k = self.drag_slow_factor_fine if fine else self.drag_slow_factor_normal
+
+        idx = self.drag_point_index
+        if 0 <= idx < len(self.align_points_items):
+            dx_scene = (scene_pos.x() - self.drag_start_scene.x()) * k
+            dy_scene = (scene_pos.y() - self.drag_start_scene.y()) * k
+
+            # Стартовая позиция в display-координатах (pixmap)
+            start_disp = self.img_to_display(self.drag_start_img_pos)
+            p0_scene = self.viewer._photo.mapToScene(start_disp)
+
+            # Новая позиция в сцене
+            p1_scene = QPointF(p0_scene.x() + dx_scene, p0_scene.y() + dy_scene)
+
+            # Назад: scene -> display -> img
+            new_disp_pos = self.viewer._photo.mapFromScene(p1_scene)
+            new_img_pos = self.display_to_img(new_disp_pos)
+
+            self.align_points_items[idx]["img_pos"] = new_img_pos
+            self._update_point_graphics(idx)
+
+            self.drag_start_scene = scene_pos
+            self.drag_start_img_pos = new_img_pos
+
+            # ВСЕГДА центрируем лупу по координатам точки
+            center_scene = self.viewer._photo.mapToScene(self.img_to_display(new_img_pos))
+            self._update_magnifier_from_viewer(center_scene, viewport_pos)
+
+
+    def on_point_release(self, scene_pos: QPointF):
+        self.dragging = False
+        self.drag_point_index = None
+        self.drag_start_scene = None
+        self.drag_start_img_pos = None
+
+    def add_point_from_image_coords(self, img_pos: QPointF):
+        # img_pos - координаты в полном разрешении (array), а не pixmap
+        if self.points_count >= 3:
+            return
+        if not self.viewer.hasPhoto():
+            return
+
+        scene = self.viewer._scene
+
+        size = self.cross_size          # общий размер перекрестия (конец лучей)
+        half = size / 2.0
+
+        circle_diam = 12.0              # диаметр кружка (в 2 раза больше, чем было 6)
+        circle_r = circle_diam / 2.0
+
+        index = self.points_count
+
+        # Переводим координаты из полного масштаба в координаты pixmap
+        disp_pos = self.img_to_display(img_pos)
+        scene_pos = self.viewer._photo.mapToScene(disp_pos)
+        cx, cy = scene_pos.x(), scene_pos.y()
+
+        # Внешние части перекрестия — яркие линии
+        outer_pen = QPen(QColor(0, 255, 0, 230), 2.0)
+        outer_pen.setCosmetic(True)
+
+        # Внутренние части, проходящие внутри круга — полупрозрачные
+        inner_pen = QPen(QColor(0, 255, 0, 120), 2.0)
+        inner_pen.setCosmetic(True)
+
+        # Горизонтальный луч:
+        #  - левая внешняя часть
+        #  - правая внешняя часть
+        #  - внутренняя часть внутри круга
+        h_outer_left = QGraphicsLineItem(cx - half, cy, cx - circle_r, cy)
+        h_outer_right = QGraphicsLineItem(cx + circle_r, cy, cx + half, cy)
+        h_inner = QGraphicsLineItem(cx - circle_r, cy, cx + circle_r, cy)
+
+        # Вертикальный луч:
+        #  - верхняя внешняя часть
+        #  - нижняя внешняя часть
+        #  - внутренняя часть внутри круга
+        v_outer_top = QGraphicsLineItem(cx, cy - half, cx, cy - circle_r)
+        v_outer_bottom = QGraphicsLineItem(cx, cy + circle_r, cx, cy + half)
+        v_inner = QGraphicsLineItem(cx, cy - circle_r, cx, cy + circle_r)
+
+        for item in (h_outer_left, h_outer_right, v_outer_top, v_outer_bottom):
+            item.setPen(outer_pen)
+            item.setZValue(1000)  # поверх изображения
+
+        for item in (h_inner, v_inner):
+            item.setPen(inner_pen)
+            item.setZValue(1000)
+
+        # Круг вокруг центра — больше чем раньше, без заливки
+        circle_pen = QPen(QColor(0, 255, 0, 200), 2.0)
+        circle_pen.setCosmetic(True)
+        circle = QGraphicsEllipseItem(
+            cx - circle_r, cy - circle_r, circle_diam, circle_diam
+        )
+        circle.setPen(circle_pen)
+        circle.setBrush(QColor(0, 0, 0, 0))  # прозрачная заливка
+        circle.setZValue(999)
+
+        # Номер точки — крупнее и немного дальше от центра
+        text_item = QGraphicsSimpleTextItem(str(index + 1))
+        text_item.setBrush(QColor(0, 255, 0, 240))
+        text_font = QFont()
+        text_font.setPointSize(30)  # было 14
+        text_item.setFont(text_font)
+        text_item.setPos(cx + half + 6, cy - half - 4)
+        text_item.setZValue(1001)
+
+        # Добавляем в сцену
+        scene.addItem(h_outer_left)
+        scene.addItem(h_outer_right)
+        scene.addItem(h_inner)
+        scene.addItem(v_outer_top)
+        scene.addItem(v_outer_bottom)
+        scene.addItem(v_inner)
+        scene.addItem(circle)
+        scene.addItem(text_item)
+
+        # Сохраняем все элементы в align_points_items
+        self.align_points_items.append({
+            "img_pos": img_pos,        # полное разрешение
+            "h_outer_left": h_outer_left,
+            "h_outer_right": h_outer_right,
+            "h_inner": h_inner,
+            "v_outer_top": v_outer_top,
+            "v_outer_bottom": v_outer_bottom,
+            "v_inner": v_inner,
+            "circle": circle,
+            "text": text_item,
+            "circle_diam": circle_diam,
+        })
+        self.points_count += 1
+        self.update_align_indicators()
+
+
+    def _update_point_graphics(self, index: int):
+        if not (0 <= index < len(self.align_points_items)):
+            return
+        if not self.viewer.hasPhoto():
+            return
+
+        item = self.align_points_items[index]
+        img_pos = item["img_pos"]  # полное разрешение
+
+        size = self.cross_size
+        half = size / 2.0
+
+        circle_diam = item.get("circle_diam", 12.0)
+        circle_r = circle_diam / 2.0
+
+        # Перевод в координаты pixmap -> scene
+        disp_pos = self.img_to_display(img_pos)
+        scene_pos = self.viewer._photo.mapToScene(disp_pos)
+        cx, cy = scene_pos.x(), scene_pos.y()
+
+        # Обновляем линии
+        item["h_outer_left"].setLine(cx - half, cy, cx - circle_r, cy)
+        item["h_outer_right"].setLine(cx + circle_r, cy, cx + half, cy)
+        item["h_inner"].setLine(cx - circle_r, cy, cx + circle_r, cy)
+
+        item["v_outer_top"].setLine(cx, cy - half, cx, cy - circle_r)
+        item["v_outer_bottom"].setLine(cx, cy + circle_r, cx, cy + half)
+        item["v_inner"].setLine(cx, cy - circle_r, cx, cy + circle_r)
+
+        # Обновляем круг
+        item["circle"].setRect(cx - circle_r, cy - circle_r, circle_diam, circle_diam)
+
+        # Обновляем позицию числа
+        item["text"].setPos(cx + half + 6, cy - half - 4)
+
+
+
+    def find_nearest_point(self, scene_pos: QPointF, max_dist: float = 20.0):
+        if not self.align_points_items:
+            return None
+        if not self.viewer.hasPhoto():
+            return None
+
+        max_d2 = max_dist * max_dist
+        best_idx = None
+        best_d2 = max_d2
+
+        for i, item in enumerate(self.align_points_items):
+            img_pos = item["img_pos"]                  # полные координаты
+            disp_pos = self.img_to_display(img_pos)    # в координаты pixmap
+            p_scene = self.viewer._photo.mapToScene(disp_pos)
+
+            dx = p_scene.x() - scene_pos.x()
+            dy = p_scene.y() - scene_pos.y()
+            d2 = dx * dx + dy * dy
+            if d2 <= best_d2:
+                best_d2 = d2
+                best_idx = i
+
+        return best_idx
+
+        
+
+    def update_align_indicators(self):
+        if not hasattr(self, "align_indicators") or len(self.align_indicators) < 3:
+            return
+
+        for i in range(3):
+            if self.points_count == 0:
+                self.set_align_point_state(i, "red")
+            else:
+                if i < self.points_count:
+                    self.set_align_point_state(i, "green")
+                else:
+                    if self.points_count < 3:
+                        self.set_align_point_state(i, "yellow")
+                    else:
+                        self.set_align_point_state(i, "green")
+
+    def set_align_point_state(self, index: int, state: str):
+        if not (0 <= index < len(self.align_indicators)):
+            return
+
+        colors = {
+            "red": "red",
+            "yellow": "yellow",
+            "green": "lime",
+        }
+        color = colors.get(state, "red")
+
+        circle = self.align_indicators[index]
+        circle.setStyleSheet(
+            f"background-color: {color};"
+            "border-radius: 7px;"
+            "border: 1px solid #555555;"
+        )
+
+    def _update_magnifier_from_viewer(self, center_scene: QPointF, viewport_pos: QPoint):
+        if not self.viewer.hasPhoto():
+            self.viewer.magnifier.hide()
+            return
+
+        self.viewer.magnifier.set_center_scene_pos(center_scene)
+
+        d = self.viewer.magnifier.diameter
+        offset = 20
+        x = viewport_pos.x() + offset
+        y = viewport_pos.y() + offset
+
+        max_x = self.viewer.viewport().width() - d
+        max_y = self.viewer.viewport().height() - d
+        x = max(0, min(x, max_x))
+        y = max(0, min(y, max_y))
+
+        self.viewer.magnifier.move(x, y)
+        self.viewer.magnifier.show()
+        self.viewer.magnifier.update()
+
+    def load_directory(self):
+        self.status_label.setText("Selecting directory...")
+        QApplication.processEvents()
+
+        dir_path = QFileDialog.getExistingDirectory(
+            self,
+            "Выберите директорию с изображениями",
+            self.last_dir,
+        )
+
+        if dir_path:
+            self.save_current_image_alignment()
+            self.save_current_reference()
+
+            self.current_dir = dir_path
+
+            self.align_file = os.path.join(self.current_dir, "alignment_points.txt")
+            self.load_alignment_store()
+            print(f"DEBUG: Alignment file: {self.align_file}")
+
+            self.file_paths = []
+            self.current_index = 0
+            self.cache.clear()
+            self.raw_cache.clear()
+            self.queued_indices.clear()
+            self.clear_align_markers()
+
+            self.settings.setValue("last_directory", dir_path)
+            self.last_dir = dir_path
+
+            self.status_label.setText("Scanning directory...")
+            QApplication.processEvents()
+
+            for root, dirs, files in os.walk(dir_path):
+                for file in files:
+                    ext = os.path.splitext(file)[1].lower()
+                    if ext in ALL_EXTS:
+                        full_path = os.path.join(root, file)
+                        self.file_paths.append(full_path)
+
+            total = len(self.file_paths)
+            if total > 0:
+                self.load_current_reference()
+                self.update_label(total)
+                self.preload_initial()
+            else:
+                self.current_label.setText("No image loaded\n0/0")
+                self.status_label.setText("No supported files found")
+
+    def preload_initial(self):
+        self.status_label.setText("Ready")
+        self.load_current_image(preserve=False)
+        self.update_reference_ui_state()
+        self.update_reference_checkbox_text()
+        self.sync_reference_checkbox()
+        
+        self.refresh_queue_for_position(window_size=3)
+
+    def update_label(self, total):
+        if total > 0:
+            filename = os.path.basename(self.file_paths[self.current_index])
+            self.current_label.setText(
+                f"{filename}\n{self.current_index + 1}/{total}"
+            )
+        else:
+            self.current_label.setText("No image loaded\n0/0")
+
+    def previous_image(self):
+        if self.current_index > 0:
+            self.save_current_image_alignment()
+            self.current_index -= 1
+            self.update_label(len(self.file_paths))
+            self.load_current_image(preserve=True)
+            self.update_reference_ui_state()
+            self.update_reference_checkbox_text()
+            self.sync_reference_checkbox()
+            self.refresh_queue_for_position(window_size=3)
+
+    def next_image(self):
+        total = len(self.file_paths)
+        if self.current_index < total - 1:
+            self.save_current_image_alignment()
+            self.current_index += 1
+            self.update_label(total)
+            self.load_current_image(preserve=True)
+            self.update_reference_ui_state()
+            self.update_reference_checkbox_text()
+            self.sync_reference_checkbox()
+            self.refresh_queue_for_position(window_size=3)
+
+    def load_current_image(self, preserve=True):
+        if not self.file_paths:
+            return
+
+        idx = self.current_index
+        path = self.file_paths[idx]
+
+        arr = self.raw_cache.get(idx)
+        if arr is None:
+            arr = self.load_image_data(path)
+            if arr is None:
+                QMessageBox.warning(
+                    self,
+                    "Ошибка",
+                    f"Не удалось загрузить {os.path.basename(path)}.",
+                )
+                self.raw_cache.pop(idx, None)
+                self.cache.pop(idx, None)
+                return
+            self.raw_cache[idx] = arr
+
+        pixmap = self.array_to_pixmap(arr)
+        if pixmap is None:
+            return
+
+        if preserve and self.viewer.hasPhoto():
+            rel_zoom = self.viewer.get_relative_zoom()
+            rel_x, rel_y = self.viewer.get_relative_pan()
+        else:
+            rel_zoom = 1.0
+            rel_x = rel_y = 0.5
+
+        self.viewer.setPhoto(
+            pixmap,
+            rel_zoom=rel_zoom,
+            rel_x=rel_x,
+            rel_y=rel_y,
+        )
+        self.cache[idx] = pixmap
+
+        self.load_image_alignment(path)
+
+    def on_stretch_slider_changed(self, value: int):
+        self.stretch_factor = value / 100.0
+        self.update_current_pixmap_only()
+        
+    def on_monochrome_changed(self, state: int):
+        self.monochrome = (state == Qt.CheckState.Checked.value or state == 2)
+
+        if not self.file_paths:
+            return
+
+        self.cache.clear()
+        self.queued_indices.clear()
+
+        self.update_current_pixmap_only()
+
+        self.refresh_queue_for_position(window_size=3)
+
+    def on_black_slider_changed(self, value: int):
+        self.black_level = value / 100.0
+        self.update_current_pixmap_only()
+        
+    def on_reduce_resolution_changed(self, text: str):
+        # text вида "1x", "2x", "4x", "6x"
+        try:
+            factor = int(text.replace("x", "").strip())
+        except ValueError:
+            factor = 1
+        if factor < 1:
+            factor = 1
+
+        new_factor = float(factor)
+        if new_factor <= 0:
+            new_factor = 1.0
+
+        self.reduce_factor = new_factor
+
+        if not self.file_paths:
+            return
+
+        # Кэш готовых pixmap зависит от масштаба — очищаем
+        self.cache.clear()
+        self.queued_indices.clear()
+
+        # Перестроить текущий pixmap с новым уменьшающим фактором
+        self.update_current_pixmap_only()
+
+        # Перезаполнить очередь подгрузки окрестности
+        self.refresh_queue_for_position(window_size=3)
+
+        # Перерисовать все точки с учётом нового масштаба
+        for i in range(len(self.align_points_items)):
+            self._update_point_graphics(i)
+
+    def update_current_pixmap_only(self):
+        if not self.file_paths:
+            return
+
+        idx = self.current_index
+        path = self.file_paths[idx]
+
+        arr = self.raw_cache.get(idx)
+        if arr is None:
+            arr = self.load_image_data(path)
+            if arr is None:
+                return
+            self.raw_cache[idx] = arr
+
+        pixmap = self.array_to_pixmap(arr)
+        if pixmap is None:
+            return
+
+        if self.viewer.hasPhoto():
+            rel_zoom = self.viewer.get_relative_zoom()
+            rel_x, rel_y = self.viewer.get_relative_pan()
+        else:
+            rel_zoom = 1.0
+            rel_x = rel_y = 0.5
+
+        self.viewer.setPhoto(
+            pixmap,
+            rel_zoom=rel_zoom,
+            rel_x=rel_x,
+            rel_y=rel_y,
+        )
+        self.cache[idx] = pixmap
+
+    def on_apply_global_clicked(self):
+        if not self.file_paths:
+            return
+
+        self.apply_global_button.setEnabled(False)
+        self.status_label.setText("Queuing all images...")
+        QApplication.processEvents()
+
+        self.queued_indices.clear()
+        self.cache.clear()
+        
+        for i in range(len(self.file_paths)):
+            path = self.file_paths[i]
+            self.task_counter += 1
+            self.loader_queue.put((
+                abs(i - self.current_index),
+                self.task_counter,
+                i,
+                path,
+                self.stretch_factor,
+                self.black_level
+            ))
+            self.queued_indices.add(i)
+
+        self.status_label.setText("Global apply queued")
+        QApplication.processEvents()
+        QTimer.singleShot(2000, lambda: self.status_label.setText("Ready"))
+        self.apply_global_button.setEnabled(True)
+
+    def _compute_rigid_transform(self, src_points: np.ndarray, ref_points: np.ndarray) -> np.ndarray:
+        src_mean = src_points.mean(axis=0)
+        ref_mean = ref_points.mean(axis=0)
+
+        X = src_points - src_mean
+        Y = ref_points - ref_mean
+
+        H = X.T @ Y  
+
+        U, S, Vt = np.linalg.svd(H)
+        R = Vt.T @ U.T  
+
+        if np.linalg.det(R) < 0:
+            Vt[1, :] *= -1
+            R = Vt.T @ U.T
+
+        t = ref_mean - R @ src_mean  
+
+        M = np.zeros((2, 3), dtype=np.float32)
+        M[:, :2] = R.astype(np.float32)
+        M[:, 2] = t.astype(np.float32)
+        return M
+
+    def on_align_clicked(self):
+        
+        if self.reference_index is None:
+            QMessageBox.warning(self, "Ошибка", "Сначала выберите Reference image!")
+            return
+        
+        ref_dir_key = self.current_dir
+        ref_img_path = self.file_paths[self.reference_index]
+        ref_img_key = self.get_image_key(ref_img_path)
+        
+        if ref_dir_key not in self.alignment_store or ref_img_key not in self.alignment_store[ref_dir_key]:
+            QMessageBox.warning(self, "Ошибка", "Reference image должно иметь 3 align points!")
+            return
+        
+        ref_points_data = self.alignment_store[ref_dir_key][ref_img_key]
+        if len(ref_points_data) != 3:
+            QMessageBox.warning(self, "Ошибка", "Reference image должно иметь ровно 3 align points!")
+            return
+        
+        output_dir = QFileDialog.getExistingDirectory(self, "Выберите папку для сохранения выровненных изображений")
+        if not output_dir:
+            return
+        
+        self.align_button.setEnabled(False)
+        self.status_label.setText("Выравнивание изображений...")
+        self.progress_bar.setVisible(True)
+        QApplication.processEvents()
+        
+        try:
+            ref_arr = self.load_image_data(ref_img_path)
+            if ref_arr is None:
+                raise Exception(f"Не удалось загрузить reference: {ref_img_path}")
+            
+            if ref_arr.ndim == 3:
+                ref_h, ref_w, ref_c = ref_arr.shape
+            else:
+                ref_h, ref_w = ref_arr.shape
+                ref_c = 1
+
+            ref_points = np.array([
+                [float(p["x"]), float(p["y"])] for p in ref_points_data
+            ], dtype=np.float32)
+            
+            aligned_count = 0
+            skipped_count = 0
+            total_images = len(self.file_paths)
+            
+            self.progress_bar.setMaximum(total_images)
+            
+            for idx, img_path in enumerate(self.file_paths):
+                self.progress_bar.setValue(idx)
+                QApplication.processEvents()
+                
+                img_key = self.get_image_key(img_path)
+                
+                if ref_dir_key not in self.alignment_store:
+                    skipped_count += 1
+                    continue
+                
+                if img_key not in self.alignment_store[ref_dir_key]:
+                    skipped_count += 1
+                    continue
+                
+                points_data = self.alignment_store[ref_dir_key][img_key]
+                
+                if not isinstance(points_data, list):
+                    skipped_count += 1
+                    continue
+                
+                if len(points_data) == 0:
+                    skipped_count += 1
+                    continue
+                
+                if len(points_data) != 3:
+                    skipped_count += 1
+                    continue
+                
+                try:
+                    src_points_array = np.array([
+                        [float(p["x"]), float(p["y"])] for p in points_data
+                    ], dtype=np.float32)
+                    
+                    if src_points_array.size == 0 or np.isnan(src_points_array).any():
+                        skipped_count += 1
+                        continue
+                        
+                except (ValueError, KeyError, TypeError) as e:
+                    skipped_count += 1
+                    continue
+      
+                img_arr = self.load_image_data(img_path)
+                if img_arr is None:
+                    skipped_count += 1
+                    continue
+                
+                if img_arr.ndim == 3:
+                    img_h, img_w, img_c = img_arr.shape
+                else:
+                    img_h, img_w = img_arr.shape
+                    img_c = 1
+
+                src_points = src_points_array.astype(np.float32)
+
+                try:
+                    if self.align_method == "rotate_shift_scale":
+                        M = cv2.getAffineTransform(src_points, ref_points)
+                    else:
+                        M = self._compute_rigid_transform(src_points, ref_points)
+                except cv2.error as e:
+                    skipped_count += 1
+                    continue
+                
+                try:
+                    output_size = (ref_w, ref_h)
+                    
+                    if img_arr.ndim == 2:
+                        warped = cv2.warpAffine(
+                            img_arr,
+                            M,
+                            output_size,
+                            flags=cv2.INTER_LINEAR,
+                            borderMode=cv2.BORDER_CONSTANT,
+                            borderValue=0
+                        )
+                    else:
+                        warped = cv2.warpAffine(
+                            img_arr,
+                            M,
+                            output_size,
+                            flags=cv2.INTER_LINEAR,
+                            borderMode=cv2.BORDER_CONSTANT,
+                            borderValue=(0, 0, 0)
+                        )    
+                    
+                    if warped.ndim == 3:
+                        warped_h, warped_w, warped_c = warped.shape
+                    else:
+                        warped_h, warped_w = warped.shape
+                    
+                    if warped_h != ref_h or warped_w != ref_w:
+                        print(f"ERROR: Warped size mismatch! Expected ({ref_h}, {ref_w}), got ({warped_h}, {warped_w})")
+                        skipped_count += 1
+                        continue
+                    
+                    output_filename = f"aligned_{aligned_count + 1:05d}.fit"
+                    output_path = os.path.join(output_dir, output_filename)
+
+                    warped_clipped = np.clip(warped, 0, 1)
+                    output_data = (warped_clipped * 65535).astype(np.uint16)
+
+                    if output_data.ndim == 3 and output_data.shape[2] == 3:
+                        output_data = np.transpose(output_data, (2, 0, 1))  # (3, height, width)
+
+                    # Создаём HDU
+                    hdu = fits.PrimaryHDU(output_data)
+
+                    # НОВОЕ: получить дату наблюдения исходного файла и записать в заголовок FITS
+                    obs_date = self.get_observation_date_for_file(img_path)
+                    if obs_date:
+                        try:
+                            # Стандартный ключ FITS
+                            hdu.header["DATE-OBS"] = (obs_date, "Observation date")  # [web:35]
+                            # Дополнительно — длинный ключ 'Observation Date' (создаст HIERARCH‑ключ)[web:41]
+                            hdu.header["Observation Date"] = obs_date
+                        except Exception as e:
+                            print(f"Не удалось записать Observation Date в {output_path}: {e}")
+
+                    # Сохраняем файл
+                    hdu.writeto(output_path, overwrite=True)
+                    aligned_count += 1
+                    self.status_label.setText(f"Выравнено {aligned_count} изображений (пропущено {skipped_count})...")
+                    QApplication.processEvents()
+                
+                except Exception as e:
+                    print(f"ERROR: Failed to warp {img_key}: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    skipped_count += 1
+                    continue
+            
+            self.progress_bar.setVisible(False)
+            self.status_label.setText(f"Готово! Выровнено {aligned_count}, пропущено {skipped_count}")
+            QMessageBox.information(
+                self, 
+                "Успех", 
+                f"✓ Выровнено {aligned_count} изображений\n✗ Пропущено {skipped_count} (без 3 points)\nСохранено в: {output_dir}"
+            )
+        
+        except Exception as e:
+            self.progress_bar.setVisible(False)
+            self.status_label.setText("Ready")
+            QMessageBox.critical(self, "Ошибка", f"Ошибка выравнивания: {str(e)}")
+            import traceback
+            traceback.print_exc()
+        
+        finally:
+            self.align_button.setEnabled(True)
+            QTimer.singleShot(2000, lambda: self.status_label.setText("Ready"))
+
+    def load_image_data(self, path):
+        ext = os.path.splitext(path)[1].lower()
+        try:
+            if ext in IMAGE_EXTS:
+                qimg = QImage(path)
+                if qimg.isNull():
+                    return None
+
+                if qimg.isGrayscale():
+                    qimg = qimg.convertToFormat(QImage.Format.Format_Grayscale8)
+                    w = qimg.width()
+                    h = qimg.height()
+                    bpl = qimg.bytesPerLine()
+                    ptr = qimg.bits()
+                    ptr.setsize(h * bpl)
+                    arr = np.frombuffer(ptr, dtype=np.uint8).reshape((h, bpl))
+                    arr = arr[:, :w]
+                    arr_f = arr.astype(np.float32) / 255.0
+                    return arr_f
+                else:
+                    qimg = qimg.convertToFormat(QImage.Format.Format_RGB888)
+                    w = qimg.width()
+                    h = qimg.height()
+                    bpl = qimg.bytesPerLine()
+                    ptr = qimg.bits()
+                    ptr.setsize(h * bpl)
+                    arr = np.frombuffer(ptr, dtype=np.uint8).reshape((h, bpl))
+                    arr = arr.reshape((h, w, 3))
+                    arr_f = arr.astype(np.float32) / 255.0
+                    return arr_f
+
+            elif ext in FITS_EXT and fits is not None:
+                with fits.open(path) as hdul:
+                    data = hdul[0].data
+                    if data is None:
+                        return None
+                    data = np.squeeze(data)
+
+                    if data.ndim == 3 and data.shape[0] == 3:
+                        data = np.transpose(data, (1, 2, 0))
+
+                    data = np.array(data, dtype=np.float32)
+                    dmin = float(np.min(data))
+                    dmax = float(np.max(data))
+                    if not np.isfinite(dmin) or not np.isfinite(dmax) or dmax <= dmin:
+                        return None
+
+                    arr_f = (data - dmin) / (dmax - dmin)
+                    arr_f = np.clip(arr_f, 0.0, 1.0)
+                    return arr_f
+
+            elif ext in RAW_EXTS and rawpy is not None:
+                with rawpy.imread(path) as raw:
+                    rgb = raw.postprocess(
+                        use_camera_wb=True,
+                        output_bps=8,
+                    )
+                rgb = np.asarray(rgb, dtype=np.uint8)
+                arr_f = rgb.astype(np.float32) / 255.0
+                return arr_f
+
+            else:
+                pixmap = QPixmap(path)
+                if pixmap.isNull():
+                    return None
+                qimg = pixmap.toImage()
+                if qimg.isGrayscale():
+                    qimg = qimg.convertToFormat(QImage.Format.Format_Grayscale8)
+                    w = qimg.width()
+                    h = qimg.height()
+                    bpl = qimg.bytesPerLine()
+                    ptr = qimg.bits()
+                    ptr.setsize(h * bpl)
+                    arr = np.frombuffer(ptr, dtype=np.uint8).reshape((h, bpl))
+                    arr = arr[:, :w]
+                    arr_f = arr.astype(np.float32) / 255.0
+                    return arr_f
+                else:
+                    qimg = qimg.convertToFormat(QImage.Format.Format_RGB888)
+                    w = qimg.width()
+                    h = qimg.height()
+                    bpl = qimg.bytesPerLine()
+                    ptr = qimg.bits()
+                    ptr.setsize(h * bpl)
+                    arr = np.frombuffer(ptr, dtype=np.uint8).reshape((h, bpl))
+                    arr = arr.reshape((h, w, 3))
+                    arr_f = arr.astype(np.float32) / 255.0
+                    return arr_f
+
+        except Exception as e:
+            print(f"Ошибка загрузки {path}: {e}")
+            return None
+
+    def _array_to_pixmap_with_params(self, arr, stretch, black):
+        if arr is None:
+            return None
+
+        img = (arr - black) * stretch
+        img = np.clip(img, 0.0, 1.0)
+
+        factor = getattr(self, "reduce_factor", 1.0)
+        if factor is None:
+            factor = 1.0
+        if factor > 1.0:
+            h, w = img.shape[:2]
+            new_w = max(1, int(w / factor))
+            new_h = max(1, int(h / factor))
+            img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+        if getattr(self, "monochrome", False) and img.ndim == 3 and img.shape[2] == 3:
+            img = img[:, :, 1]
+
+        img_u8 = (img * 255.0 + 0.5).astype(np.uint8)
+
+        if img_u8.ndim == 2:
+            h, w = img_u8.shape
+            qimg = QImage(
+                img_u8.tobytes(),
+                w,
+                h,
+                w,
+                QImage.Format.Format_Grayscale8,
+            )
+            return QPixmap.fromImage(qimg)
+
+        elif img_u8.ndim == 3 and img_u8.shape[2] == 3:
+            h, w, c = img_u8.shape
+            bytes_per_line = w * 3
+            qimg = QImage(
+                img_u8.tobytes(),
+                w,
+                h,
+                bytes_per_line,
+                QImage.Format.Format_RGB888,
+            )
+            return QPixmap.fromImage(qimg)
+
+        return None
+
+    def array_to_pixmap(self, arr):
+        return self._array_to_pixmap_with_params(arr, self.stretch_factor, self.black_level)
 
 if __name__ == "__main__":
-    app = AstroAligner()
-    app.run()
+    app = QApplication(sys.argv)
+    viewer = ImageViewer()
+    viewer.showMaximized() 
+    sys.exit(app.exec())
