@@ -8,7 +8,7 @@ from datetime import datetime
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, QWidget, QPushButton,
                             QLabel, QFileDialog, QProgressBar, QGraphicsView, QGraphicsScene, QGraphicsPixmapItem,
                             QMessageBox, QGraphicsLineItem, QGraphicsSimpleTextItem, QSlider, QCheckBox, QComboBox,
-                            QGraphicsEllipseItem)
+                            QGraphicsEllipseItem, QLineEdit)
 from PyQt6.QtGui import (QPixmap, QImage, QCursor, QPen, QFont, QPainter, QPainterPath, QColor)
 from PyQt6.QtCore import (Qt, QRectF, QPoint, QPointF, QSettings, QTimer, pyqtSignal, QObject)
 
@@ -442,9 +442,45 @@ class ImageViewer(QMainWindow):
         self.align_type_combo.installEventFilter(self)
         left_layout.addWidget(self.align_type_combo)
 
-        self.current_label = QLabel("No image loaded\n0/0")
-        self.current_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        left_layout.addWidget(self.current_label)
+        # Navigation row with filename and go-to controls
+        nav_row = QWidget()
+        nav_layout = QHBoxLayout(nav_row)
+        nav_layout.setContentsMargins(0, 0, 0, 0)
+        nav_layout.setSpacing(6)
+
+        self.filename_label = QLabel("No image loaded")
+        self.filename_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        nav_layout.addWidget(self.filename_label, 1)  # Stretch to fill space
+
+        # Current index display
+        self.current_index_label = QLabel("0")
+        nav_layout.addWidget(self.current_index_label)
+
+        self.separator_label = QLabel("/")
+        nav_layout.addWidget(self.separator_label)
+
+        self.total_count_label = QLabel("0")
+        nav_layout.addWidget(self.total_count_label)
+
+        # Go to section
+        go_to_label = QLabel("  Go to:")
+        nav_layout.addWidget(go_to_label)
+
+        self.go_to_input = QLineEdit()
+        self.go_to_input.setMaximumWidth(50)
+        self.go_to_input.setPlaceholderText("#")
+        self.go_to_input.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.go_to_input.returnPressed.connect(self.on_go_to)
+        nav_layout.addWidget(self.go_to_input)
+
+        self.go_to_button = QPushButton("Go")
+        self.go_to_button.setMaximumWidth(35)
+        self.go_to_button.clicked.connect(self.on_go_to)
+        self.go_to_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        nav_layout.addWidget(self.go_to_button)
+
+        nav_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        left_layout.addWidget(nav_row)
 
         self.align_indicators = []
         for text in ["Align point 1", "Align point 2", "Align point 3"]:
@@ -1568,7 +1604,9 @@ class ImageViewer(QMainWindow):
                 self.update_label(total)
                 self.preload_initial()
             else:
-                self.current_label.setText("No image loaded\n0/0")
+                self.filename_label.setText("No image loaded")
+                self.current_index_label.setText("0")
+                self.total_count_label.setText("0")
                 self.status_label.setText("No supported files found")
 
     def preload_initial(self):
@@ -1583,11 +1621,43 @@ class ImageViewer(QMainWindow):
     def update_label(self, total):
         if total > 0:
             filename = os.path.basename(self.file_paths[self.current_index])
-            self.current_label.setText(
-                f"{filename}\n{self.current_index + 1}/{total}"
-            )
+            self.filename_label.setText(filename)
+            self.current_index_label.setText(str(self.current_index + 1))
+            self.total_count_label.setText(str(total))
         else:
-            self.current_label.setText("No image loaded\n0/0")
+            self.filename_label.setText("No image loaded")
+            self.current_index_label.setText("0")
+            self.total_count_label.setText("0")
+
+    def on_go_to(self):
+        """Navigate to the image number specified in the go-to input field."""
+        if not self.file_paths:
+            return
+
+        text = self.go_to_input.text().strip()
+        if not text:
+            return
+
+        try:
+            target_num = int(text)
+            total = len(self.file_paths)
+
+            if 1 <= target_num <= total:
+                self.save_current_image_alignment()
+                self.current_index = target_num - 1  # Convert to 0-based index
+                self.update_label(total)
+                self.load_current_image(preserve=True)
+                self.update_reference_ui_state()
+                self.update_reference_checkbox_text()
+                self.sync_reference_checkbox()
+                self.refresh_queue_for_position(window_size=3)
+                self.go_to_input.clear()  # Clear input after navigation
+            else:
+                self.status_label.setText(f"Invalid number. Enter 1-{total}")
+                QTimer.singleShot(2000, lambda: self.status_label.setText("Ready"))
+        except ValueError:
+            self.status_label.setText("Please enter a valid number")
+            QTimer.singleShot(2000, lambda: self.status_label.setText("Ready"))
 
     def previous_image(self):
         if self.current_index > 0:
@@ -2088,47 +2158,59 @@ class ImageViewer(QMainWindow):
         if arr is None:
             return None
 
-        img = (arr - black) * stretch
-        img = np.clip(img, 0.0, 1.0)
+        img = np.asarray(arr, dtype=np.float32)
 
-        factor = getattr(self, "reduce_factor", 1.0)
-        if factor is None:
-            factor = 1.0
+        # Нормальная яркость вместо голого green channel
+        if img.ndim == 3 and img.shape[2] == 3:
+            lum = 0.2126 * img[:, :, 0] + 0.7152 * img[:, :, 1] + 0.0722 * img[:, :, 2]
+        else:
+            lum = img
+
+        finite = lum[np.isfinite(lum)]
+        if finite.size == 0:
+            return None
+
+        # Робастные display-уровни
+        lo_p = min(10.0, black * 10.0)      # slider -> low percentile
+        lo = np.percentile(finite, lo_p)
+        hi = np.percentile(finite, 99.8)
+        if hi <= lo:
+            hi = lo + 1e-6
+
+        if getattr(self, "monochrome", False) or img.ndim == 2:
+            work = lum
+        else:
+            work = img
+
+        work = (work - lo) / (hi - lo)
+        work = np.clip(work, 0.0, 1.0)
+
+        # Нелинейный stretch вместо чисто линейного
+        s = max(0.1, float(stretch))
+        work = np.arcsinh(work * (6.0 * s)) / np.arcsinh(6.0 * s)
+
+        # Уменьшать лучше уже после stretch
+        factor = getattr(self, "reduce_factor", 1.0) or 1.0
         if factor > 1.0:
-            h, w = img.shape[:2]
+            h, w = work.shape[:2]
             new_w = max(1, int(w / factor))
             new_h = max(1, int(h / factor))
-            img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            work = cv2.resize(work, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
 
-        if getattr(self, "monochrome", False) and img.ndim == 3 and img.shape[2] == 3:
-            img = img[:, :, 1]
-
-        img_u8 = (img * 255.0 + 0.5).astype(np.uint8)
+        img_u8 = np.clip(work * 255.0 + 0.5, 0, 255).astype(np.uint8)
 
         if img_u8.ndim == 2:
             h, w = img_u8.shape
-            qimg = QImage(
-                img_u8.tobytes(),
-                w,
-                h,
-                w,
-                QImage.Format.Format_Grayscale8,
-            )
+            qimg = QImage(img_u8.tobytes(), w, h, w, QImage.Format.Format_Grayscale8)
             return QPixmap.fromImage(qimg)
 
         elif img_u8.ndim == 3 and img_u8.shape[2] == 3:
-            h, w, c = img_u8.shape
-            bytes_per_line = w * 3
-            qimg = QImage(
-                img_u8.tobytes(),
-                w,
-                h,
-                bytes_per_line,
-                QImage.Format.Format_RGB888,
-            )
+            h, w, _ = img_u8.shape
+            qimg = QImage(img_u8.tobytes(), w, h, w * 3, QImage.Format.Format_RGB888)
             return QPixmap.fromImage(qimg)
 
         return None
+
 
     def array_to_pixmap(self, arr):
         return self._array_to_pixmap_with_params(arr, self.stretch_factor, self.black_level)
